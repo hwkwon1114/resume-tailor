@@ -1,0 +1,24 @@
+{# Jinja2 template that renders a FeedbackMessage into the user prompt block.
+   Replaces (does NOT append to) the prior attempt's feedback. #}
+The previous attempt failed validation. Fix these specific issues:
+
+{% if schema_errors %}SCHEMA:
+{% for err in schema_errors %}  - {{ err }}
+{% endfor %}{% endif %}
+{% if source_attribution_errors %}SOURCE ATTRIBUTION (every output bullet needs valid source_ids):
+{% for err in source_attribution_errors %}  - {{ err }}
+{% endfor %}{% endif %}
+{% if field_lock_errors %}FIELD LOCK (these fields must be byte-identical to input):
+{% for err in field_lock_errors %}  - {{ err }}
+{% endfor %}{% endif %}
+{% if page_fit_overflow %}PAGE FIT (overflowed onto page 2; drop or compress these bullets, ranked by JD-relevance ascending):
+{% for bid in page_fit_overflow %}  - {{ bid }}
+{% endfor %}{% endif %}
+{% if jd_coverage_missing %}JD COVERAGE (current score: {{ jd_coverage_score }}; surface these missing keywords if you have authentic experience to back them):
+{% for kw in jd_coverage_missing %}  - {{ kw }}
+{% endfor %}{% endif %}
+{% if fabrication_flagged %}FABRICATION (these output bullets scored below 0.6 on the support audit; fix the source-grounding or remove them):
+{% for f in fabrication_flagged %}  - {{ f.bullet_id }} (score={{ f.score }}): {{ f.reason }}
+{% endfor %}{% endif %}
+
+Re-emit the FULL tailored resume with these fixes applied.

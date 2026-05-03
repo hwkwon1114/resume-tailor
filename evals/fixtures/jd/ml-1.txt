@@ -1,0 +1,18 @@
+Machine Learning Research Scientist — Scientific ML
+
+We're hiring an ML research scientist to apply modern deep learning to physical-simulation problems. You'll design surrogate models, run training experiments, and publish results.
+
+Responsibilities:
+- Build PyTorch-based surrogate models for expensive physics simulations.
+- Run gradient-based design optimization loops combining simulation and machine learning.
+- Design and execute training experiments with proper baselines and ablations.
+- Co-author papers and conference submissions.
+- Collaborate with engineers to ship the resulting models into production pipelines.
+
+Requirements:
+- Strong PyTorch and Python skills.
+- Experience training surrogate models, neural operators, or physics-informed neural networks.
+- Comfort with automatic differentiation, JAX or PyTorch autograd.
+- Background in optimization (gradient-based methods, topology optimization, design of experiments).
+- Track record of publishing or submitting to peer-reviewed venues.
+- Familiarity with finite-element analysis, computational mechanics, or scientific simulation.

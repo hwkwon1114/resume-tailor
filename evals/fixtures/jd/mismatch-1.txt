@@ -1,0 +1,18 @@
+Senior Frontend Engineer — Design System
+
+We're hiring a senior frontend engineer to lead our design-system effort. You'll build reusable React components, contribute to design tokens, and make sure the product feels consistent end-to-end.
+
+Responsibilities:
+- Build and maintain a React component library with TypeScript and Storybook.
+- Implement complex layouts in CSS, including grid, flexbox, and container queries.
+- Drive accessibility (WCAG 2.2 AA) across the component set.
+- Collaborate with designers in Figma, translating tokens to CSS variables.
+- Manage build tooling: Vite, ESLint, Prettier, Vitest.
+- Mentor frontend teammates on TypeScript patterns and component design.
+
+Requirements:
+- 5+ years of professional frontend engineering with React.
+- Deep TypeScript expertise.
+- Strong CSS skills and an eye for visual detail.
+- Experience with design systems, Storybook, and visual regression testing.
+- Track record of accessibility-first development.

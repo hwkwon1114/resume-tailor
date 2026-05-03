@@ -1,0 +1,17 @@
+Distributed Systems Engineer — Real-Time Edge Compute
+
+We're building a high-throughput edge-compute platform and we need an engineer fluent in our exact stack. This is an aggressive hire — we want production experience, not "I'd like to learn."
+
+Responsibilities:
+- Build performance-critical components in Rust.
+- Compile to WebAssembly and deploy to edge runtimes; tune WASM binary size and cold-start latency.
+- Design wire protocols using Cap'n Proto for cross-service messaging.
+- Write integration tests against a real edge cluster.
+- Profile and optimize end-to-end latency.
+
+Requirements:
+- 3+ years of production Rust development. Tokio async runtime experience required.
+- Hands-on WebAssembly experience: compilation, optimization, debugging.
+- Cap'n Proto schema design and code generation experience required.
+- Familiarity with edge runtimes (Cloudflare Workers, Fastly Compute@Edge, Fermyon Spin).
+- Strong systems-programming background.

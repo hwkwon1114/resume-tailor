@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit secrets
+.env
+.env.*
+
+# Generated artifacts
+*.pdf
+evals/report*.md
+.cache/
+evals/.cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# OMC / Claude state
+.omc/state/
+.omg/
+.claude/
+
+# Pytest
+.pytest_cache/
+
+# Personal resume data
+resume_converted.json
+resume.json
+"MASTER RESUME !.pdf"
+
+# OMC planning artifacts
+.omc/

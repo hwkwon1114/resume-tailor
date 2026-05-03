@@ -1,0 +1,19 @@
+Senior Backend Engineer — Computational Platform
+
+We're hiring a backend engineer to build the data and computation platform that powers our scientific-simulation product. You'll design APIs, orchestrate long-running compute jobs, and make sure simulation pipelines run reliably and scale.
+
+Responsibilities:
+- Build Python services that schedule and execute numerical simulation jobs.
+- Design data pipelines for storing simulation inputs, intermediate state, and outputs.
+- Optimize hot paths in scientific computing code (NumPy, SciPy, sparse linear algebra).
+- Write integration tests with pytest and CI pipelines on GitHub Actions.
+- Containerize services with Docker for reproducible deployments.
+- Mentor junior engineers on Python performance, profiling, and software architecture.
+
+Requirements:
+- Strong Python with experience in NumPy, SciPy, or similar numerical libraries.
+- Experience profiling and optimizing computational workloads.
+- Familiarity with finite-element or simulation pipelines is a plus.
+- Comfort writing automated tests and managing CI.
+- Experience with Docker and reproducible environments.
+- Track record mentoring or teaching technical content.

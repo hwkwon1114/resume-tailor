@@ -1,0 +1,80 @@
+{
+  "contact": {
+    "name": "Hyunwoo Kwon",
+    "email": "hwkwon1114@gmail.com",
+    "phone": "(847) 555-1234",
+    "location": "Evanston, IL",
+    "links": ["github.com/hwkwon", "linkedin.com/in/hyunwoo-kwon"]
+  },
+  "summary": "Mechanical engineering PhD candidate at Northwestern with experience in computational mechanics, topology optimization, and Python-driven simulation pipelines.",
+  "experience": [
+    {
+      "employer": "Northwestern University",
+      "title": "Graduate Research Assistant",
+      "start_date": "2023-09",
+      "end_date": null,
+      "location": "Evanston, IL",
+      "bullets": [
+        {"text": "Built a multi-material topology optimization pipeline in Python and JAX for soft robotic gel-elastomer composites; co-authored ASME IDETC 2026 submission GELATO."},
+        {"text": "Wrote finite-element solvers in NumPy and SciPy that reduced per-iteration solve time from 12 to 3 seconds via sparse linear-algebra refactoring."},
+        {"text": "Trained surrogate models in PyTorch on simulation outputs to accelerate design-space exploration by 40x."},
+        {"text": "Mentored two junior students on JAX, automatic differentiation, and gradient-based optimization workflows."}
+      ]
+    },
+    {
+      "employer": "Argonne National Laboratory",
+      "title": "Visiting Researcher (Summer)",
+      "start_date": "2024-06",
+      "end_date": "2024-09",
+      "location": "Lemont, IL",
+      "bullets": [
+        {"text": "Implemented uncertainty quantification routines for material-property estimation in additive manufacturing."},
+        {"text": "Profiled and optimized a Fortran finite-element kernel; documented results in an internal technical memo."},
+        {"text": "Presented findings at the lab's summer symposium to a 30-person audience of staff scientists."}
+      ]
+    }
+  ],
+  "education": [
+    {
+      "school": "Northwestern University",
+      "degree": "PhD, Mechanical Engineering",
+      "start_date": "2023-09",
+      "end_date": "2028-06",
+      "gpa": "4.0",
+      "bullets": [
+        {"text": "Coursework: continuum mechanics, finite elements, computational design optimization, statistical learning."}
+      ]
+    },
+    {
+      "school": "Seoul National University",
+      "degree": "BS, Mechanical Engineering",
+      "start_date": "2017-03",
+      "end_date": "2023-02",
+      "gpa": "3.85",
+      "bullets": []
+    }
+  ],
+  "projects": [
+    {
+      "name": "GELATO",
+      "description": "Open-source topology-optimization library for hydrogel composites.",
+      "bullets": [
+        {"text": "Designed a JAX-based forward solver supporting heterogeneous element materials and gradient-based design updates."},
+        {"text": "Built a Streamlit demo for interactive parameter sweeps; used by three collaborating labs."}
+      ]
+    },
+    {
+      "name": "PIANO Eval Harness",
+      "description": "Personal project: evaluation pipeline for physics-informed neural networks.",
+      "bullets": [
+        {"text": "Implemented a regression test suite with PyTorch and pytest covering five PINN architectures and four PDE benchmarks."},
+        {"text": "Containerized the harness with Docker and continuous integration via GitHub Actions."}
+      ]
+    }
+  ],
+  "skills": [
+    "Python", "JAX", "NumPy", "SciPy", "PyTorch", "Pandas", "Streamlit", "pytest",
+    "Topology optimization", "Finite element analysis", "Surrogate modeling", "Gradient-based optimization",
+    "MATLAB", "C++", "Git", "Docker", "LaTeX"
+  ]
+}
