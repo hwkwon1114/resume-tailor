@@ -14,6 +14,7 @@ The previous attempt failed validation. Fix these specific issues:
 {% if page_fit_overflow %}PAGE FIT (overflowed onto page 2; drop or compress these bullets, ranked by JD-relevance ascending):
 {% for bid in page_fit_overflow %}  - {{ bid }}
 {% endfor %}{% endif %}
+{% if page_fit_underutilized %}PAGE FILL: {{ page_fit_underutilized }}{% endif %}
 {% if jd_coverage_missing %}JD COVERAGE (current score: {{ jd_coverage_score }}; surface these missing keywords if you have authentic experience to back them):
 {% for kw in jd_coverage_missing %}  - {{ kw }}
 {% endfor %}{% endif %}

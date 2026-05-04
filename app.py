@@ -6,12 +6,15 @@ Live values, not just labels (validates AC-7).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 from harness.orchestrator import OrchestratorResult, run
 from harness.pdf_intake import extract_text_from_pdf

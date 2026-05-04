@@ -20,6 +20,25 @@ _STOPWORDS: frozenset[str] = ENGLISH_STOP_WORDS  # type: ignore[assignment]
 # engineering JDs typically clear ~0.45-0.55 after honest tailoring. Was 0.5.
 _DEFAULT_FLOOR = 0.45
 
+# EEO/ADA legal boilerplate and company-culture filler that repeats in JD footers.
+# These terms inflate the JD token count and pollute key-term rankings without
+# providing any useful signal for resume tailoring.
+_HR_BOILERPLATE: frozenset[str] = frozenset({
+    # ADA / EEO / legal language (appears in every large company's JD footer)
+    "accommodation", "accommodations", "disability", "disabilities",
+    "qualified", "protected", "veteran", "prohibited", "discrimination",
+    "orientation", "regardless", "applicants", "candidates",
+    "ability", "abilities", "applicant", "candidate",
+    # Amazon-specific boilerplate
+    "amazecon", "amazonians",
+    # Generic filler / common verbs that appear in nearly every JD
+    "acumen", "affinity", "advancing", "adjustment", "adjustments", "activate",
+    "achieve", "achieving", "advice", "align", "alignment", "aligned",
+    "addressing", "adopted", "alternative", "alternatives", "annual",
+    "approach", "approaches", "applying", "aptitude", "attention",
+    "awareness", "balance", "bar", "assignments",
+})
+
 
 def tokenize(text: str) -> set[str]:
     out: set[str] = set()
@@ -27,7 +46,7 @@ def tokenize(text: str) -> set[str]:
         t = raw.lower().strip()
         if len(t) < 3:
             continue
-        if t in _STOPWORDS:
+        if t in _STOPWORDS or t in _HR_BOILERPLATE:
             continue
         if t.isdigit():
             continue

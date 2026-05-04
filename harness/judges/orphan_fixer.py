@@ -37,7 +37,7 @@ For each bullet, rewrite it to EITHER:
 Rules:
 - Do NOT change the meaning, facts, or quantitative claims.
 - Do NOT add fabricated details.
-- Prefer option (a) — clean single-line — unless cutting loses a key metric at the end.
+- Prefer option (b) — expand to a full two-liner — add method, context, or scope detail using only facts already in the bullet. Only fall back to option (a) if there is genuinely no additional detail to add.
 - Return only the rewritten text strings, one per bullet, in the same order.
 """
 

@@ -83,12 +83,34 @@ def run(
         candidate = _boost_skills_from_jd(candidate, input_resume, jd)
         last_resume = candidate
 
+        exp_summary = [(e.employer, len(e.bullets)) for e in candidate.experience]
+        proj_summary = [(p.name[:30], len(p.bullets)) for p in candidate.projects]
+        total_bullets = sum(b for _, b in exp_summary) + sum(b for _, b in proj_summary)
+        log.info(
+            "[attempt %d] generated — exp: %s | proj: %s | total bullets: %d",
+            attempt, exp_summary, proj_summary, total_bullets,
+        )
+
         if progress:
             progress("validating", {"attempt": attempt})
         validator_results = run_all(output=candidate, input_resume=input_resume, jd=jd)
-        # page_fit is non-blocking — all physical page fitting happens in post-processing.
-        # The loop only retries on things LLM feedback can actually fix.
+        # page_fit overflow is non-blocking (post-processing trims it).
+        # Underutilization IS retried so the LLM gets explicit "add more content" feedback,
+        # but only on non-final attempts so we don't exhaust retries chasing an unfillable page.
         mechanical_passed = all(v.passed for v in validator_results if v.name != "page_fit")
+        _pf_result = next((v for v in validator_results if v.name == "page_fit"), None)
+        _util_pct = _pf_result.payload.get("page_utilization_pct", 100) if _pf_result else 100
+        _pages = _pf_result.payload.get("pages", 1) if _pf_result else 1
+        page_underutilized = _util_pct < 90 and attempt < max_retries
+        page_overflowed = _pages > 1 and attempt < max_retries
+        log.info(
+            "[attempt %d] page_fit — pages=%s util=%d%% underutilized=%s mechanical_passed=%s",
+            attempt,
+            _pf_result.payload.get("pages", "?") if _pf_result else "?",
+            _util_pct,
+            page_underutilized,
+            mechanical_passed,
+        )
 
         # JD coverage judge runs every attempt — gives semantic score + uncovered reqs for feedback.
         if progress:
@@ -113,7 +135,15 @@ def run(
         ))
 
         jd_passed = jd_cov_result is None or jd_cov_result.passed
-        if mechanical_passed and jd_passed:
+        _will_exit = mechanical_passed and jd_passed and not page_underutilized and not page_overflowed
+        log.info(
+            "[attempt %d] decision — jd_passed=%s page_underutilized=%s page_overflowed=%s → %s",
+            attempt, jd_passed, page_underutilized, page_overflowed,
+            "EXIT" if _will_exit else "RETRY",
+        )
+        if not _will_exit:
+            log.info("[attempt %d] feedback:\n%s", attempt, feedback.render() if not feedback.is_empty() else "(empty)")
+        if _will_exit:
             candidate = _fix_and_trim_orphans(candidate, judge_client, input_resume, jd)
             return OrchestratorResult(
                 passed=True,
@@ -146,14 +176,18 @@ def _build_feedback(validators: list[ValidationResult], jd_cov: JDCoverageResult
         fb.source_attribution_errors = list(sa.errors)
     if (fl := by_name.get("field_lock")) and not fl.passed:
         fb.field_lock_errors = list(fl.errors)
-    if (pf := by_name.get("page_fit")) and not pf.passed:
-        fb.page_fit_overflow = list(pf.payload.get("overflow_bullet_ids", []))
+    if pf := by_name.get("page_fit"):
+        if not pf.passed:
+            fb.page_fit_overflow = list(pf.payload.get("overflow_bullet_ids", []))
+        util = pf.payload.get("page_utilization_pct", 100)
+        if util < 85:
+            fb.page_fit_underutilized = (
+                f"Page is only {util}% full — add a 3rd or 4th experience role, "
+                "or add more bullets to existing roles, to reach ≥90% page utilization."
+            )
     if jd_cov is not None and not jd_cov.passed:
         fb.jd_coverage_score = round(jd_cov.score, 3)
         fb.jd_coverage_missing = list(jd_cov.uncovered_requirements[:15])
-    elif (jc := by_name.get("jd_coverage")):
-        fb.jd_coverage_score = round(jc.score, 3)
-        fb.jd_coverage_missing = list(jc.payload.get("missing_keywords_top", []))
     return fb
 
 
@@ -189,6 +223,10 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
         if overflow_ids2:
             resume = _trim_for_page_fit(resume, input_resume, jd, overflow_ids2, max_iterations=5)
 
+    exp_summary = [(e.employer, len(e.bullets)) for e in resume.experience]
+    total_bullets = sum(b for _, b in exp_summary) + sum(len(p.bullets) for p in resume.projects)
+    final_util = pf2.payload.get("page_utilization_pct", "?")
+    log.info("post-processing final — exp: %s | total bullets: %d | util: %s%%", exp_summary, total_bullets, final_util)
     return resume
 
 
@@ -314,6 +352,7 @@ def _trim_for_page_fit(
         scored.sort(key=lambda kv: kv[1])  # ascending — drop lowest first
         drop_id = scored[0][0]
         current = _prune_bullets(current, {drop_id})
+        current = _drop_empty_sections(current)  # clean up roles emptied by pruning
     return current
 
 

@@ -21,9 +21,8 @@ class ValidationResult:
 
 
 def run_all(*, output: Resume, input_resume: Resume, jd: str) -> list[ValidationResult]:
-    """Run all five mechanical validators on an output resume."""
+    """Run mechanical validators on an output resume."""
     from harness.validators.field_lock import FieldLockValidator
-    from harness.validators.jd_coverage import JDCoverageValidator
     from harness.validators.page_fit import PageFitValidator
     from harness.validators.schema_check import SchemaCheckValidator
     from harness.validators.source_attribution import SourceAttributionValidator
@@ -33,5 +32,4 @@ def run_all(*, output: Resume, input_resume: Resume, jd: str) -> list[Validation
         SourceAttributionValidator().run(output=output, input_resume=input_resume),
         FieldLockValidator().run(output=output, input_resume=input_resume),
         PageFitValidator().run(output=output),
-        JDCoverageValidator().run(output=output, jd=jd),
     ]

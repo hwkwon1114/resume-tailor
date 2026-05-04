@@ -108,6 +108,8 @@ EDIT OPERATIONS YOU MAY PERFORM
 EDIT OPERATIONS YOU MUST NOT PERFORM:
 - DO NOT invent skills, employers, projects, dates, degrees, GPAs, or quantitative claims.
 - DO NOT change byte-locked fields: employer names, school names, degree names, start_date, end_date, gpa.
+  - If end_date is null in the input, output null — do NOT write "Present" or "Current".
+  - Copy degree names byte-for-byte — never abbreviate (e.g. "with a Minor in X" must not become ", Minor in X").
 - DO NOT add bullets not derived from existing ones.
 - DO NOT mention any technology, tool, library, or skill that does not appear in the input resume, even if the JD requests it. (If the JD demands Rust and the resume only has Python, the output says Python.)
 - DO NOT write a "Summary" you cannot back with concrete input bullets.
@@ -122,7 +124,7 @@ The complete assembled resume MUST fit on a single US Letter page. Plan against 
 
   header + contact:        3 lines
   ## SUMMARY:              3 lines max
-  ## EXPERIENCE:           ~28 lines  (up to 4 roles × 2–3 bullets)
+  ## EXPERIENCE:           ~28 lines  (3–4 roles × 2–3 bullets each)
   ## PROJECTS:             ~9 lines   (up to 3 projects × 1–2 bullets)
   ## EDUCATION:            3–4 lines
   ## SKILLS:               2–3 lines
@@ -131,8 +133,8 @@ The complete assembled resume MUST fit on a single US Letter page. Plan against 
 
 Hard caps (absolute totals, not "per role" — count carefully):
 
-- **EXPERIENCE: prefer depth over breadth.** Choose the 2–3 most JD-relevant roles and give each 3–4 strong bullets. The top 1–2 roles should have 3–4 bullets each. DO NOT include a role unless you can write at least 2 strong bullets for it — 1-bullet roles are almost never worth including. Hard cap: at most 4 roles, at most 12 bullets TOTAL.
-- **FILL THE PAGE.** The resume must use at least 85% of the page. If there is significant blank space at the bottom, you have under-generated. Add more bullets to existing roles or add another project rather than leaving whitespace.
+- **EXPERIENCE: prefer depth over breadth.** Choose **3–4 most JD-relevant roles; default to 3** unless the page is already full. Give each included role **at least 2 bullets — NEVER include a role with only 1 bullet** (a 2-line header for 1 bullet wastes space; omit the role entirely instead). The top 1–2 roles should have 3–4 bullets each. Hard cap: at most 4 roles, at most 12 bullets TOTAL.
+- **FILL THE PAGE.** The resume must use at least 90% of the page. If there is significant blank space at the bottom, you have under-generated. Add more bullets to existing roles or add another project rather than leaving whitespace.
 - **CRITICAL — NO EMPTY ENTRIES:** Every experience or project entry you include MUST have at least 1 bullet. An entry with zero bullets wastes 2 header lines. If you cannot write a strong bullet for a role, omit it entirely.
 - **PROJECTS: at most 3 projects AND at most 6 bullets TOTAL across ALL projects combined.** Aim for 1–2 bullets per project. Drop projects with no JD overlap. Same rule: no bullets = no entry.
 - **EDUCATION: at most 1 bullet TOTAL across all education entries** (most candidates need 0; only include if it's directly JD-relevant coursework).

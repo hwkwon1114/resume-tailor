@@ -51,6 +51,7 @@ class FeedbackMessage:
     source_attribution_errors: list[str] = field(default_factory=list)
     field_lock_errors: list[str] = field(default_factory=list)
     page_fit_overflow: list[str] = field(default_factory=list)
+    page_fit_underutilized: str | None = None
     jd_coverage_score: float | None = None
     jd_coverage_missing: list[str] = field(default_factory=list)
     fabrication_flagged: list[dict] = field(default_factory=list)
@@ -61,6 +62,7 @@ class FeedbackMessage:
             or self.source_attribution_errors
             or self.field_lock_errors
             or self.page_fit_overflow
+            or self.page_fit_underutilized
             or self.jd_coverage_missing
             or self.fabrication_flagged
         )
@@ -71,6 +73,7 @@ class FeedbackMessage:
             source_attribution_errors=self.source_attribution_errors,
             field_lock_errors=self.field_lock_errors,
             page_fit_overflow=self.page_fit_overflow,
+            page_fit_underutilized=self.page_fit_underutilized,
             jd_coverage_score=self.jd_coverage_score,
             jd_coverage_missing=self.jd_coverage_missing,
             fabrication_flagged=self.fabrication_flagged,
