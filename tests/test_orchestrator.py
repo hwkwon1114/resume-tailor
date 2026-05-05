@@ -3,14 +3,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from harness.generate import TailoringResponse
 from harness.judges.fabrication_audit import _AuditReport
 from harness.models import EchoModelClient, ModelResponse
-from harness.orchestrator import run
+from harness.orchestrator import (
+    _ensure_clean_ending,
+    _fix_and_trim_orphans,
+    _iterative_shrink_to_fit,
+    _mechanical_trim_orphans,
+    _pop_last_skill,
+    _shortest_expandable_bullets,
+    _trim_for_page_fit,
+    run,
+)
 from harness.schema import Resume, autopopulate_bullet_ids
+from harness.validators import ValidationResult
+from harness.validators.page_fit import BulletGeometry
 
 _RESUME_PATH = Path(__file__).resolve().parent.parent / "evals/fixtures/resume/me.json"
 
@@ -108,3 +120,405 @@ def test_retry_budget_cap_with_always_failing_model():
     result = run(jd="python", input_resume=inp, model=model, max_retries=3)
     assert not result.passed
     assert len(result.trajectory) == 4  # initial + 3 retries
+
+
+# ── Bug #1, #2, #3 regression tests ──────────────────────────────────────────
+
+def _resume_with_skills(skills: list[str], bullets_per_role: int = 3) -> Resume:
+    bullets = [
+        {"id": f"exp-0-b{i}", "text": f"Bullet {i} text.", "source_ids": ["src"]}
+        for i in range(bullets_per_role)
+    ]
+    return Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL", "bullets": bullets,
+        }],
+        "education": [], "projects": [], "skills": list(skills),
+    })
+
+
+class _NoopModel:
+    def generate_structured(self, **kw):
+        from harness.judges.orphan_fixer import _FixResult
+        return ModelResponse(data=_FixResult(rewrites=[], drop_ids=[]), model_name="noop")
+
+
+# Bug #1: _drop_empty_sections must run after fix_bullets so 1-bullet
+# experience entries (created by LLM drops) are removed.
+def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
+    """_fix_and_trim_orphans must call _drop_empty_sections after fix_bullets.
+
+    Setup: a resume with one 2-bullet role; fix_bullets drops one bullet,
+    leaving a 1-bullet role. Without the post-drop _drop_empty_sections call,
+    the 1-bullet role would survive.
+    """
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0", "text": "a" * 130, "source_ids": ["src"]},  # orphan
+                {"id": "b1", "text": "Other bullet.", "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    # PageFitValidator stub: always passes, util 95% pre-fix and 95% post-fix
+    # (so the rescue path is not triggered).
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 95},
+        )
+
+    # fix_bullets stub: drop b1 (LLM "decides" to drop the non-orphan).
+    def fake_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        data = resume_in.model_dump()
+        for sec in data["experience"]:
+            sec["bullets"] = [b for b in sec["bullets"] if b["id"] != "b1"]
+        return Resume.model_validate(data)
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=fake_fix_bullets):
+        result = _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    # The role had 2 bullets, fix_bullets dropped one, leaving 1.
+    # _drop_empty_sections must have removed the now-1-bullet role entirely.
+    assert len(result.experience) == 0, (
+        "Bug #1: _drop_empty_sections must run after fix_bullets to remove "
+        f"experience entries with <2 bullets, got {len(result.experience)}"
+    )
+
+
+# Bug #2: skills overflow → pop trailing skills before dropping bullets.
+def test_pop_last_skill_drops_least_important():
+    resume = _resume_with_skills(["Python", "JAX", "Rust"])
+    popped = _pop_last_skill(resume)
+    assert popped.skills == ["Python", "JAX"]
+
+
+def test_trim_for_page_fit_pops_skills_before_bullets():
+    """When overflow_bullet_ids is empty (skills overflow), drop trailing skills first."""
+    skills = [f"skill-{i}" for i in range(15)]  # 15 > floor of 8
+    resume = _resume_with_skills(skills, bullets_per_role=3)
+
+    call_count = {"n": 0}
+
+    def fake_pf_run(self, output):
+        # First 4 calls: still overflowing with empty overflow_ids.
+        # 5th call: passes — verifies we kept popping skills, not bullets.
+        call_count["n"] += 1
+        passed = call_count["n"] >= 5
+        return ValidationResult(
+            name="page_fit", passed=passed, score=1.0 if passed else 0.5,
+            errors=[] if passed else ["overflow"],
+            payload={"pages": 1 if passed else 2, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 100},
+        )
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        result = _trim_for_page_fit(resume, resume, "jd", [], max_iterations=10)
+
+    # Bullets must be untouched; only skills should have been trimmed.
+    assert len(result.experience[0].bullets) == 3, "no bullets should have been dropped"
+    assert len(result.skills) < 15, "skills should have been trimmed"
+
+
+def test_trim_for_page_fit_skills_floor_at_8():
+    """Skills trimming stops at 8; further overflow falls through to bullet drops."""
+    skills = [f"skill-{i}" for i in range(10)]  # 10 → can pop 2 before hitting floor
+    resume = _resume_with_skills(skills, bullets_per_role=3)
+
+    def fake_pf_run(self, output):
+        # Always overflowing with empty overflow_ids — forces fall-through
+        # to bullet dropping after skills hit the floor.
+        return ValidationResult(
+            name="page_fit", passed=False, score=0.5, errors=["overflow"],
+            payload={"pages": 2, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 100},
+        )
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        result = _trim_for_page_fit(resume, resume, "jd", [], max_iterations=5)
+
+    # Skills floor at 8, so at most 2 pops, then iterations spent dropping bullets.
+    assert len(result.skills) == 8, f"expected skills floor at 8, got {len(result.skills)}"
+
+
+# Bug #3: shortest-bullet rescue when post-processing shrinks the page.
+def test_shortest_expandable_bullets_returns_n_shortest():
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0", "text": "a" * 50, "source_ids": ["src"]},
+                {"id": "b1", "text": "a" * 80, "source_ids": ["src"]},
+                {"id": "b2", "text": "a" * 30, "source_ids": ["src"]},
+                {"id": "b3", "text": "a" * 200, "source_ids": ["src"]},  # excluded (>120)
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+    ids = _shortest_expandable_bullets(resume, n=2)
+    assert ids == ["b2", "b0"], f"expected [b2, b0] (shortest two ≤120), got {ids}"
+
+
+# ── _iterative_shrink_to_fit ─────────────────────────────────────────────────
+
+def test_iterative_shrink_to_fit_pops_until_two_lines():
+    """Shrink keeps popping trailing words until injected geometry says line_count <= max_lines."""
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0",
+                 "text": "one two three four five six seven eight nine ten eleven twelve",
+                 "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    # Stub: report 3 lines until the bullet has <= 8 words, then 2 lines.
+    def measure(r):
+        for sec in r.experience:
+            for b in sec.bullets:
+                if b.id == "b0":
+                    n = len(b.text.split())
+                    return {"b0": BulletGeometry(
+                        line_count=3 if n > 8 else 2,
+                        last_line_ratio=0.5, text_length=len(b.text),
+                    )}
+        return {}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure)
+    final_words = result.experience[0].bullets[0].text.split()
+    assert len(final_words) == 8, f"expected 8 words after popping, got {len(final_words)}"
+
+
+def test_iterative_shrink_to_fit_noop_when_already_fits():
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [{"id": "b0", "text": "short bullet text here", "source_ids": ["src"]}],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    def measure(r):
+        return {"b0": BulletGeometry(line_count=1, last_line_ratio=0.5, text_length=22)}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure)
+    assert result.experience[0].bullets[0].text == "short bullet text here."
+
+
+def test_iterative_shrink_to_fit_stops_at_three_word_floor():
+    """Don't gut a bullet below 3 words even if geometry still says >max_lines."""
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [{"id": "b0", "text": "one two three four", "source_ids": ["src"]}],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    def measure(r):  # never satisfied
+        return {"b0": BulletGeometry(line_count=5, last_line_ratio=0.1, text_length=20)}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure)
+    # 4 words → pop one to 3 → next iteration sees len(words)=3, returns early.
+    assert result.experience[0].bullets[0].text == "one two three."
+
+
+# ── _ensure_clean_ending ─────────────────────────────────────────────────────
+
+def test_ensure_clean_ending_strips_dangling_connective_pair():
+    assert _ensure_clean_ending("partners and team") == "partners."
+
+
+def test_ensure_clean_ending_strips_across_digital():
+    assert _ensure_clean_ending("engagement across digital") == "engagement."
+
+
+def test_ensure_clean_ending_preserves_complete_sentence():
+    assert _ensure_clean_ending("Built ML pipeline cutting latency 40%.") == "Built ML pipeline cutting latency 40%."
+
+
+def test_ensure_clean_ending_adds_period_to_complete_phrase():
+    assert _ensure_clean_ending("Reduced API latency 40 percent") == "Reduced API latency 40 percent."
+
+
+def test_ensure_clean_ending_strips_trailing_comma():
+    assert _ensure_clean_ending("Managed 60+ clients,") == "Managed 60+ clients."
+
+
+def test_ensure_clean_ending_keeps_existing_terminator():
+    assert _ensure_clean_ending("Question?") == "Question?"
+
+
+def test_ensure_clean_ending_handles_solo_connective():
+    assert _ensure_clean_ending("partners and") == "partners."
+
+
+def test_ensure_clean_ending_empty_after_stripping_returns_original():
+    original = "and or but"
+    assert _ensure_clean_ending(original) == original
+
+
+def test_iterative_shrink_to_fit_cleans_ending_after_pops():
+    """After popping words, the final bullet text must pass through _ensure_clean_ending."""
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0",
+                 "text": "Managed deliverables for partners and team members ensuring communication",
+                 "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    # Stub: report 3 lines until <= 6 words (simulates trimming off "members ensuring communication",
+    # leaving "Managed deliverables for partners and team" — a dangling connective pair).
+    def measure(r):
+        for sec in r.experience:
+            for b in sec.bullets:
+                if b.id == "b0":
+                    n = len(b.text.split())
+                    return {"b0": BulletGeometry(
+                        line_count=3 if n > 6 else 2,
+                        last_line_ratio=0.5, text_length=len(b.text),
+                    )}
+        return {}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure)
+    final_text = result.experience[0].bullets[0].text
+    # "and team" is a dangling connective pair — must be stripped.
+    assert not final_text.rstrip(".").endswith(" and"), f"dangling 'and' survived: {final_text!r}"
+    assert not final_text.rstrip(".").endswith(" and team"), f"dangling 'and team' survived: {final_text!r}"
+    assert final_text.endswith("."), f"bullet must end with period: {final_text!r}"
+
+
+# ── LLM cleanup wiring ────────────────────────────────────────────────────────
+
+def _make_shrink_resume(text: str) -> Resume:
+    return Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [{"id": "b0", "text": text, "source_ids": ["src"]}],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+
+class _StubCleanModel:
+    """Returns the given clean text from llm_clean_truncated (via _CleanRewrite schema)."""
+    def __init__(self, clean_text: str):
+        self._clean_text = clean_text
+
+    def generate_structured(self, *, system, prompt, schema):
+        return ModelResponse(data=schema.model_validate({"text": self._clean_text}), model_name="stub")
+
+
+class _ErrorCleanModel:
+    def generate_structured(self, **kw):
+        raise RuntimeError("stub error")
+
+
+def test_iterative_shrink_uses_llm_for_cleanup():
+    """LLM cleanup is called after word-popping; result replaces truncated text."""
+    long_text = "one two three four five six seven eight nine ten eleven twelve"
+    clean_rewrite = "one two three four five six seven eight."
+    resume = _make_shrink_resume(long_text)
+    model = _StubCleanModel(clean_rewrite)
+
+    def measure(r):
+        for sec in r.experience:
+            for b in sec.bullets:
+                if b.id == "b0":
+                    n = len(b.text.split())
+                    return {"b0": BulletGeometry(
+                        line_count=3 if n > 8 else 2,
+                        last_line_ratio=0.5, text_length=len(b.text),
+                    )}
+        return {}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure, model=model)
+    assert result.experience[0].bullets[0].text == clean_rewrite
+
+
+def test_iterative_shrink_falls_back_to_mechanical_strip_on_llm_error():
+    """When the LLM raises, _ensure_clean_ending is used as a safety net."""
+    long_text = "one two three four five six seven eight nine ten eleven twelve"
+    resume = _make_shrink_resume(long_text)
+    model = _ErrorCleanModel()
+
+    def measure(r):
+        for sec in r.experience:
+            for b in sec.bullets:
+                if b.id == "b0":
+                    n = len(b.text.split())
+                    return {"b0": BulletGeometry(
+                        line_count=3 if n > 8 else 2,
+                        last_line_ratio=0.5, text_length=len(b.text),
+                    )}
+        return {}
+
+    result = _iterative_shrink_to_fit(resume, "b0", max_lines=2, measure=measure, model=model)
+    final_text = result.experience[0].bullets[0].text
+    # LLM failed — mechanical ending must still produce a period-terminated bullet.
+    assert final_text.endswith("."), f"expected period termination, got: {final_text!r}"
+    assert len(final_text.split()) == 8, f"expected 8 words after popping, got: {final_text!r}"
+
+
+def test_mechanical_trim_uses_llm_for_cleanup():
+    """llm_clean_truncated is called in _mechanical_trim_orphans; result replaces word-popped text."""
+    danger_text = "a" * 130  # in orphan danger zone
+    clean_rewrite = "Shortened cleanly by LLM."
+    resume = _make_shrink_resume(danger_text)
+    model = _StubCleanModel(clean_rewrite)
+
+    result = _mechanical_trim_orphans(resume, ["b0"], model=model)
+    assert result.experience[0].bullets[0].text == clean_rewrite

@@ -7,8 +7,17 @@ stage.
 """
 from __future__ import annotations
 
-from harness.schema import Resume
+from dataclasses import dataclass
+
+from harness.schema import Resume, iter_bullets
 from harness.validators import ValidationResult
+
+
+@dataclass(slots=True, frozen=True)
+class BulletGeometry:
+    line_count: int
+    last_line_ratio: float
+    text_length: int
 
 
 class PageFitValidator:
@@ -131,3 +140,59 @@ def _walk_boxes(box):
     children = getattr(box, "children", None) or ()
     for child in children:
         yield from _walk_boxes(child)
+
+
+def measure_bullet_geometry(resume: Resume) -> dict[str, BulletGeometry]:
+    """Render the resume and return per-bullet geometry from WeasyPrint's box tree.
+
+    Returns {bullet_id: BulletGeometry} where line_count counts the indented
+    content lines (the bullet-marker `::before` line is excluded), and
+    last_line_ratio = last_content_line.width / available_content_width.
+    """
+    from render.pdf import render_to_document
+    from weasyprint.formatting_structure.boxes import LineBox
+
+    text_lengths = {b.id: len(b.text) for b in iter_bullets(resume)}
+
+    try:
+        doc = render_to_document(resume)
+    except Exception:  # noqa: BLE001
+        return {}
+
+    # Multiple boxes can carry the same data-bullet-id (the ::before pseudo-element
+    # box also inherits it). Pick the widest box per id — that's the real <li>.
+    widest: dict[str, tuple] = {}
+    for page in doc.pages:
+        for box in _walk_boxes(page._page_box):
+            element = getattr(box, "element", None)
+            if element is None:
+                continue
+            attrs = getattr(element, "attrib", {})
+            bid = attrs.get("data-bullet-id") if attrs else None
+            if not bid:
+                continue
+            w = getattr(box, "width", 0) or 0
+            if bid not in widest or widest[bid][1] < w:
+                widest[bid] = (box, w)
+
+    geometry: dict[str, BulletGeometry] = {}
+    for bid, (li_box, li_w) in widest.items():
+        try:
+            lines = [d for d in _walk_boxes(li_box) if isinstance(d, LineBox)]
+            li_px = getattr(li_box, "position_x", 0) or 0
+            content_lines = [ln for ln in lines if (getattr(ln, "position_x", 0) or 0) > li_px + 1]
+            if not content_lines:
+                continue
+            indent = (getattr(content_lines[0], "position_x", 0) or 0) - li_px
+            avail = li_w - indent if li_w > indent else li_w
+            last = content_lines[-1]
+            last_w = getattr(last, "width", 0) or 0
+            ratio = (last_w / avail) if avail > 0 else 1.0
+            geometry[bid] = BulletGeometry(
+                line_count=len(content_lines),
+                last_line_ratio=min(ratio, 1.0),
+                text_length=text_lengths.get(bid, 0),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return geometry

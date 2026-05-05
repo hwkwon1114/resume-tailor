@@ -9,7 +9,7 @@ import pytest
 _RESUME_PATH = Path(__file__).resolve().parent.parent / "evals/fixtures/resume/me.json"
 
 try:
-    from harness.validators.page_fit import PageFitValidator
+    from harness.validators.page_fit import PageFitValidator, measure_bullet_geometry
     from harness.schema import Resume, autopopulate_bullet_ids
     _AVAILABLE = True
 except OSError:  # pragma: no cover
@@ -47,3 +47,16 @@ def test_overflow_emits_bullet_ids():
     assert res.payload["overflow_bullet_ids"], (
         f"pages={res.payload['pages']} but overflow_bullet_ids was empty"
     )
+
+
+def test_measure_bullet_geometry_returns_per_bullet_geometry():
+    """measure_bullet_geometry returns line_count + last_line_ratio for every bullet."""
+    r = _load()
+    geom = measure_bullet_geometry(r)
+    # At least one bullet must be measured.
+    assert geom, "expected non-empty geometry for the baseline resume"
+    # Every measured bullet has plausible values.
+    for bid, g in geom.items():
+        assert g.line_count >= 1, f"{bid}: line_count={g.line_count}"
+        assert 0.0 <= g.last_line_ratio <= 1.0, f"{bid}: ratio={g.last_line_ratio}"
+        assert g.text_length > 0, f"{bid}: text_length={g.text_length}"

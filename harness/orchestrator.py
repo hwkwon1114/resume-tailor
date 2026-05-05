@@ -19,7 +19,15 @@ from typing import Any, Callable
 
 from harness.generate import FeedbackMessage, generate
 from harness.judges.jd_coverage_judge import JDCoverageJudge, JDCoverageResult
-from harness.judges.orphan_fixer import detect_orphans, fix_orphans
+from harness.judges.orphan_fixer import (
+    SINGLE_LINE_MAX,
+    OrphanCategory,
+    detect_orphans,
+    detect_orphans_geometry,
+    fix_bullets,
+    fix_orphans,
+    llm_clean_truncated,
+)
 from harness.judges.voice_check import VoiceCheck, VoiceCheckResult
 from harness.models import ModelClient
 from harness.ranking import rank_bullets_by_jd
@@ -29,6 +37,36 @@ from harness.validators import ValidationResult, run_all
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_RETRIES = 3
+
+_HANGING_CONNECTIVES = frozenset({
+    "and", "or", "but", "with", "by", "for", "to", "in", "on", "at", "of",
+    "a", "an", "the", "as", "while", "across", "through", "via",
+    "including", "using", "from", "into", "than", "that", "which",
+})
+
+
+def _ensure_clean_ending(text: str) -> str:
+    """Strip trailing dangling connectives and ensure the bullet ends with a period.
+
+    A dangling connective (e.g. 'and team', 'across digital') signals a truncated
+    phrase. We strip the connective AND the word that followed it together.
+    """
+    original = text
+    text = text.rstrip(" .,;:-")
+    words = text.split()
+    # Repeatedly strip "<connective> <word>" pairs at the tail.
+    while len(words) >= 2 and words[-2].lower().rstrip(".,;:") in _HANGING_CONNECTIVES:
+        words.pop()  # drop the trailing word
+        words.pop()  # drop the connective itself
+    # Strip any remaining trailing standalone connective.
+    while words and words[-1].lower().rstrip(".,;:") in _HANGING_CONNECTIVES:
+        words.pop()
+    text = " ".join(words).rstrip(" .,;:-")
+    if not text:
+        return original
+    if text[-1] not in ".!?":
+        text += "."
+    return text
 
 
 @dataclass(slots=True)
@@ -192,58 +230,231 @@ def _build_feedback(validators: list[ValidationResult], jd_cov: JDCoverageResult
 
 
 def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resume, jd: str) -> Resume:
-    """Post-processing: page trim → orphan fix → page trim again.
+    """Post-processing: LLM fixes orphans + trims/drops overflow candidates, then mechanical fallback.
 
-    1. Page-fit trim first (handles overflow from generation)
-    2. LLM rewrite of danger-zone bullets (expand to 2 full lines or cut to 1)
-    3. Mechanical trim fallback for any still in the danger zone
-    4. Page-fit check again (orphan expansion can cause new overflow)
+    1. Identify orphan bullets (danger zone) and overflow candidates (if page > 1)
+       without dropping anything yet.
+    2. One LLM call handles both: fix orphans (expand or trim) and trim/drop
+       overflow candidates — the LLM sees the full content and decides.
+    3. Mechanical trim fallback for any orphans the LLM missed.
+    4. Mechanical drop fallback if the resume is still > 1 page after the LLM pass.
     """
     from harness.validators.page_fit import PageFitValidator
 
-    # Step 1: trim any page overflow from generation
+    # Step 1: assess page fit and identify candidates — no drops yet.
     pf = PageFitValidator().run(resume)
+    util = pf.payload.get("page_utilization_pct", 100)
+
+    overflow_candidate_ids: list[str] = []
     if not pf.passed:
-        overflow_ids = pf.payload.get("overflow_bullet_ids") or []
-        if overflow_ids:
-            resume = _trim_for_page_fit(resume, input_resume, jd, overflow_ids, max_iterations=5)
+        # Pass the bottom-ranked bullets as overflow candidates for the LLM to
+        # trim or drop. Use enough candidates to plausibly fix the overflow.
+        overflow_candidate_ids = _rank_worst_bullets(resume, input_resume, jd, n=5)
 
-    # Step 2: fix orphan bullets
-    orphans = detect_orphans(resume)
-    if orphans:
-        resume = fix_orphans(resume, orphans, model)
-        still_bad = detect_orphans(resume)
-        if still_bad:
-            resume = _mechanical_trim_orphans(resume, still_bad)
+    # Step 2: combined LLM pass — fix orphans and trim/drop overflow candidates.
+    pre_fix_util = util
+    orphan_cats = detect_orphans_geometry(resume)
+    if orphan_cats:
+        orphans = list(orphan_cats.keys())
+    else:
+        # Geometry unavailable (render failed / no weasyprint) — fall back to char-based.
+        orphans = detect_orphans(resume)
+    if orphans or overflow_candidate_ids:
+        resume = fix_bullets(
+            resume, orphans, overflow_candidate_ids, model,
+            page_utilization_pct=util,
+            orphan_categories=orphan_cats or None,
+        )
+        # Re-measure after the LLM pass; any bullet still 3+ lines gets mechanically shrunk.
+        post_cats = detect_orphans_geometry(resume)
+        for bid, cat in post_cats.items():
+            if cat in (OrphanCategory.THREE_LINE_ORPHAN, OrphanCategory.THREE_LINE_FULL):
+                resume = _iterative_shrink_to_fit(resume, bid, max_lines=2, model=model)
+        if not post_cats:  # geometry path unavailable — char-based fallback
+            still_bad = detect_orphans(resume)
+            if still_bad:
+                resume = _mechanical_trim_orphans(resume, still_bad, model=model)
+        # Bug #1: fix_bullets may drop bullets via drop_ids, leaving experience
+        # entries with <2 bullets. Re-enforce the structural rule.
+        resume = _drop_empty_sections(resume)
 
-    # Step 3: re-check page fit after orphan expansion
+    # Step 3: mechanical drop fallback — only if the LLM pass was not enough.
     pf2 = PageFitValidator().run(resume)
     if not pf2.passed:
-        overflow_ids2 = pf2.payload.get("overflow_bullet_ids") or []
-        if overflow_ids2:
-            resume = _trim_for_page_fit(resume, input_resume, jd, overflow_ids2, max_iterations=5)
+        resume = _trim_for_page_fit(resume, input_resume, jd, [], max_iterations=5)
+
+    # Bug #3: post-processing may shrink the page (drops, 2-liner→1-liner).
+    # If util fell significantly and there are clean 1-liners we could grow back
+    # into 2-liners, run one expansion-biased rescue pass.
+    pf3 = PageFitValidator().run(resume)
+    final_util = pf3.payload.get("page_utilization_pct", 100)
+    if pf3.passed and final_util < pre_fix_util - 5:
+        expand_ids = _shortest_expandable_bullets(resume, n=3)
+        if expand_ids:
+            rescued = fix_bullets(
+                resume, [], [], model,
+                page_utilization_pct=100,
+                force_expand_ids=expand_ids,
+            )
+            rescued_pf = PageFitValidator().run(rescued)
+            if rescued_pf.passed:
+                resume = rescued
+                pf3 = rescued_pf
+                final_util = pf3.payload.get("page_utilization_pct", final_util)
 
     exp_summary = [(e.employer, len(e.bullets)) for e in resume.experience]
     total_bullets = sum(b for _, b in exp_summary) + sum(len(p.bullets) for p in resume.projects)
-    final_util = pf2.payload.get("page_utilization_pct", "?")
     log.info("post-processing final — exp: %s | total bullets: %d | util: %s%%", exp_summary, total_bullets, final_util)
     return resume
 
 
-def _mechanical_trim_orphans(resume: Resume, orphan_ids: list[str]) -> Resume:
-    """Last-resort: trim trailing words until bullet is ≤ 95 chars (clean single line)."""
-    from harness.judges.orphan_fixer import SINGLE_LINE_MAX
-    id_set = set(orphan_ids)
+def _shortest_expandable_bullets(resume: Resume, n: int) -> list[str]:
+    """Return ids of the n shortest TYPE A candidate bullets (≤120 chars).
+
+    These are clean 1-liners that have headroom to grow into a full 2-liner.
+    """
+    candidates = [b for b in iter_bullets(resume) if len(b.text) <= SINGLE_LINE_MAX]
+    candidates.sort(key=lambda b: len(b.text))
+    return [b.id for b in candidates[:n]]
+
+
+def _iterative_shrink_to_fit(
+    resume: Resume,
+    bullet_id: str,
+    *,
+    max_lines: int = 2,
+    max_pops: int = 30,
+    measure: Callable[[Resume], dict] | None = None,
+    model: ModelClient | None = None,
+) -> Resume:
+    """Pop trailing words from bullet_id, re-measuring each time, until line_count <= max_lines.
+
+    measure — injected for tests; defaults to measure_bullet_geometry.
+    """
+    if measure is None:
+        from harness.validators.page_fit import measure_bullet_geometry
+        measure = measure_bullet_geometry
+
+    # Capture original before any popping so the LLM has full context.
+    original_text: str | None = None
+    for key in ("experience", "education", "projects"):
+        for section in getattr(resume, key):
+            for b in section.bullets:
+                if b.id == bullet_id:
+                    original_text = b.text
+    if original_text is None:
+        return resume
+
+    current = resume
+    for _ in range(max_pops):
+        geom = measure(current)
+        g = geom.get(bullet_id)
+        if g is None or g.line_count <= max_lines:
+            break
+        data = current.model_dump()
+        popped = False
+        for key in ("experience", "education", "projects"):
+            for section in data[key]:
+                for bullet in section["bullets"]:
+                    if bullet["id"] != bullet_id:
+                        continue
+                    words = bullet["text"].split()
+                    if len(words) <= 3:
+                        truncated = " ".join(words)
+                        if model is not None:
+                            clean = llm_clean_truncated(original_text, truncated, 240, model)
+                        else:
+                            clean = None
+                        bullet["text"] = clean if clean is not None else _ensure_clean_ending(truncated)
+                        return Resume.model_validate(data)
+                    words.pop()
+                    bullet["text"] = " ".join(words)
+                    popped = True
+                    break
+                if popped:
+                    break
+            if popped:
+                break
+        if not popped:
+            break
+        current = Resume.model_validate(data)
+
+    # Popping loop exited — apply LLM cleanup on the truncated result.
+    truncated_text: str | None = None
+    for key in ("experience", "education", "projects"):
+        for section in getattr(current, key):
+            for b in section.bullets:
+                if b.id == bullet_id:
+                    truncated_text = b.text
+    if truncated_text is not None and model is not None:
+        clean = llm_clean_truncated(original_text, truncated_text, 240, model)
+        if clean is not None:
+            data = current.model_dump()
+            for key in ("experience", "education", "projects"):
+                for section in data[key]:
+                    for bullet in section["bullets"]:
+                        if bullet["id"] == bullet_id:
+                            bullet["text"] = clean
+            return Resume.model_validate(data)
+
+    return _apply_clean_ending(current, bullet_id)
+
+
+def _apply_clean_ending(resume: Resume, bullet_id: str) -> Resume:
     data = resume.model_dump()
     for key in ("experience", "education", "projects"):
         for section in data[key]:
             for bullet in section["bullets"]:
-                if bullet["id"] in id_set:
-                    words = bullet["text"].split()
-                    while len(" ".join(words)) > SINGLE_LINE_MAX and len(words) > 3:
-                        words.pop()
-                    bullet["text"] = " ".join(words)
+                if bullet["id"] == bullet_id:
+                    bullet["text"] = _ensure_clean_ending(bullet["text"])
+                    return Resume.model_validate(data)
+    return resume
+
+
+def _mechanical_trim_orphans(
+    resume: Resume, orphan_ids: list[str], model: ModelClient | None = None
+) -> Resume:
+    """Last-resort: trim trailing words until bullet is ≤ SINGLE_LINE_MAX chars (clean single line)."""
+    from harness.judges.orphan_fixer import SINGLE_LINE_MAX
+    id_set = set(orphan_ids)
+    data = resume.model_dump()
+    original_texts = {
+        b["id"]: b["text"]
+        for key in ("experience", "education", "projects")
+        for section in data[key]
+        for b in section["bullets"]
+        if b["id"] in id_set
+    }
+    for key in ("experience", "education", "projects"):
+        for section in data[key]:
+            for bullet in section["bullets"]:
+                if bullet["id"] not in id_set:
+                    continue
+                words = bullet["text"].split()
+                while len(" ".join(words)) > SINGLE_LINE_MAX and len(words) > 3:
+                    words.pop()
+                truncated = " ".join(words)
+                if model is not None:
+                    clean = llm_clean_truncated(
+                        original_texts[bullet["id"]], truncated, SINGLE_LINE_MAX, model
+                    )
+                else:
+                    clean = None
+                bullet["text"] = clean if clean is not None else _ensure_clean_ending(truncated)
     return Resume.model_validate(data)
+
+
+def _rank_worst_bullets(resume: Resume, input_resume: Resume, jd: str, n: int) -> list[str]:
+    """Return ids of the n lowest-JD-ranked bullets in the resume."""
+    input_scores = {bs.bullet_id: bs.score for bs in rank_bullets_by_jd(input_resume, jd)}
+
+    def score(b) -> float:
+        if not b.source_ids:
+            return 0.0
+        return max(input_scores.get(sid, 0.0) for sid in b.source_ids)
+
+    scored = sorted(iter_bullets(resume), key=score)
+    return [b.id for b in scored[:n]]
 
 
 def _prune_bullets(resume: Resume, drop_ids: set[str]) -> Resume:
@@ -295,14 +506,17 @@ def _boost_skills_from_jd(resume: Resume, input_resume: Resume, jd: str) -> Resu
 
 
 def _drop_empty_sections(resume: Resume) -> Resume:
-    """Remove experience and project entries with zero bullets.
+    """Remove low-bullet experience/project entries after generation.
 
-    Empty entries consume 2 header lines each and add no value. Education entries
-    are kept even without bullets (degree + GPA lines are always worth showing).
+    - Experience entries with < 2 bullets are dropped: a 2-line header for 1 bullet
+      wastes space and violates the prompt rule. The prompt instructs the LLM not to
+      do this, but mechanical enforcement ensures it.
+    - Project entries with 0 bullets are dropped (1 bullet is acceptable for projects).
+    - Education entries are kept even without bullets (degree + GPA lines always show).
     """
     data = resume.model_dump()
-    for key in ("experience", "projects"):
-        data[key] = [s for s in data[key] if s["bullets"]]
+    data["experience"] = [s for s in data["experience"] if len(s["bullets"]) >= 2]
+    data["projects"] = [s for s in data["projects"] if s["bullets"]]
     return Resume.model_validate(data)
 
 
@@ -339,21 +553,54 @@ def _trim_for_page_fit(
         if pf_result.passed:
             return current
         live_overflow = pf_result.payload.get("overflow_bullet_ids") or []
-        if not live_overflow:
+
+        # Bug #2: Skills overflow leaves overflow_bullet_ids empty (the Skills
+        # section has no data-bullet-id). Pop the trailing (least-relevant) skill
+        # before sacrificing real achievement bullets. Floor at 8 per the prompt's
+        # "8–14 skills total" guidance.
+        if not live_overflow and len(current.skills) > _SKILLS_FLOOR:
+            current = _pop_last_skill(current)
+            continue
+
+        # Score every bullet in the current resume.
+        all_scored: list[tuple[str, float]] = [
+            (b.id, output_bullet_score(b.id, b.source_ids)) for b in iter_bullets(current)
+        ]
+        if not all_scored:
             return current
 
-        # Build (bullet_id, score) for currently-overflowing bullets only.
-        scored: list[tuple[str, float]] = []
-        for b in iter_bullets(current):
-            if b.id in live_overflow:
-                scored.append((b.id, output_bullet_score(b.id, b.source_ids)))
-        if not scored:
-            return current
+        # If specific bullets were flagged as overflowing, restrict to those.
+        # Otherwise (skills exhausted, still overflowing), drop the lowest-ranked
+        # bullet overall to free up space.
+        if live_overflow:
+            overflow_set = set(live_overflow)
+            scored = [(bid, score) for bid, score in all_scored if bid in overflow_set]
+            if not scored:
+                scored = all_scored
+        else:
+            scored = all_scored
+
         scored.sort(key=lambda kv: kv[1])  # ascending — drop lowest first
         drop_id = scored[0][0]
         current = _prune_bullets(current, {drop_id})
         current = _drop_empty_sections(current)  # clean up roles emptied by pruning
     return current
+
+
+_SKILLS_FLOOR = 8
+
+
+def _pop_last_skill(resume: Resume) -> Resume:
+    """Return a copy of resume with the last skill removed.
+
+    Skills are ordered by JD relevance (most important first), so popping the
+    tail drops the least important skill.
+    """
+    if not resume.skills:
+        return resume
+    data = resume.model_dump()
+    data["skills"] = data["skills"][:-1]
+    return Resume.model_validate(data)
 
 
 def _metrics(validators, jd_cov, voice) -> dict[str, Any]:

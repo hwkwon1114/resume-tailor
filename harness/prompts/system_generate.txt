@@ -53,7 +53,11 @@ For each input bullet you choose to keep, do these three steps in order:
    - Open with a JD verb (Built / Led / Designed / Reduced / Shipped / Scaled).
    - Frame in JD context (use JD vocabulary, not the input's vocabulary).
    - Close with the original metric or concrete outcome.
-   - 15–40 words. Can wrap to 2 lines — the page-fit validator enforces the actual page limit.
+   - **Before writing, decide the format:**
+     - **1-liner (15–18 words / ≤120 chars):** the metric and scope speak for themselves — no method needed. Write it tight and stop.
+     - **2-liner (30–40 words / ≥200 chars):** the HOW adds real signal — include method or process on the second line. Both lines must carry weight.
+     - Do NOT write 19–29 words — that range produces orphan lines that look unprofessional.
+   - Across all your output bullets, aim for roughly half 1-liners and half 2-liners. Do not default to 2-liners for everything.
 
 You are changing the LANGUAGE, not the MEANING.
 
@@ -138,7 +142,11 @@ Hard caps (absolute totals, not "per role" — count carefully):
 - **CRITICAL — NO EMPTY ENTRIES:** Every experience or project entry you include MUST have at least 1 bullet. An entry with zero bullets wastes 2 header lines. If you cannot write a strong bullet for a role, omit it entirely.
 - **PROJECTS: at most 3 projects AND at most 6 bullets TOTAL across ALL projects combined.** Aim for 1–2 bullets per project. Drop projects with no JD overlap. Same rule: no bullets = no entry.
 - **EDUCATION: at most 1 bullet TOTAL across all education entries** (most candidates need 0; only include if it's directly JD-relevant coursework).
-- **EVERY bullet: aim for a clean single line (15–20 words) or a solid two-line bullet (25–35 words).** A post-processor will fix any bullets that spill just 1–2 words onto a second line, but write clean bullets from the start.
+- **EVERY bullet must land cleanly in one of two zones — skip the middle:**
+  - **1-line bullet (≤ 18 words / ≤120 chars):** Use when the achievement is self-contained — action + outcome + scale in one punch. Best for bullets where the metric speaks for itself.
+  - **2-line bullet (≥ 30 words / ≥200 chars):** Use when there is a *method or process* worth showing in addition to the outcome. The second line must be at least half full of real content — not filler.
+  - **Let content richness decide — mix both freely.** A page of uniform 2-liners reads as AI-generated. Aim for a natural spread: roughly half 1-liners and half 2-liners, based on how much context the achievement genuinely needs.
+  - **AVOID the 120–200 char range** — bullets that length render as 1 full line + a few orphan words, which looks unprofessional. Either trim to ≤120 or expand to ≥200.
 - **TOTAL OUTPUT BULLET BUDGET: 12 experience + 6 project + 1 education = 19 bullets MAXIMUM.** The page-fit validator trims overflow — fill the page with depth, not breadth.
 - If an input experience or project has no JD-relevant content after Phase 1/2, omit it entirely. Empty `bullets: []` arrays are fine for kept entries that don't merit a bullet.
 
@@ -177,7 +185,12 @@ EVERY output bullet MUST set source_ids to a non-empty list of input bullet ids 
 - A pure rewrite (Phase-2 reconstruct) with no factual change still cites the source: source_ids=["exp-0-b1"].
 - An output bullet with empty source_ids will be REJECTED.
 
-Output bullet ids should follow "{section_id}-out-{n}" so they don't collide with input ids.
+Output BULLET ids should follow "{section_id}-out-{n}" so they don't collide with input ids.
+
+SECTION IDs (the `id` field on experience, education, and project entries) MUST be copied
+byte-for-byte from the input — they are locked the same way as employer names and dates.
+- Input experience entry id "exp-1" → output must also use id "exp-1". NEVER write "exp-1-out".
+- The "-out-{n}" suffix applies ONLY to the bullet `id` fields inside a section, not to the section itself.
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT

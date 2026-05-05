@@ -1,93 +1,280 @@
 """Orphan bullet fixer — detects and rewrites danger-zone bullets.
 
 At 10.5pt Times New Roman with 0.4in margins on US Letter, one line fits
-roughly 98 characters. A bullet in the range 96–130 chars renders as 1 line
+roughly 123 characters. A bullet in the range 121–165 chars renders as 1 line
 plus a few orphan words — it looks worse than either a clean 1-liner or a
 full 2-liner.
 
-Detection: character count heuristic (96–130 = danger zone).
-Fix: one targeted LLM call to rewrite only the flagged bullets.
+Detection: character count heuristic (121–165 = danger zone).
+Fix: one targeted LLM call that also handles overflow candidates.
 """
 from __future__ import annotations
 
 import json
+from enum import Enum
 
 from pydantic import BaseModel, Field
 
 from harness.models import ModelClient
 from harness.schema import Resume, iter_bullets
+from harness.validators.page_fit import BulletGeometry
 
 SINGLE_LINE_MAX = 120  # ≤ this → fits on one line (Times NR 10.5pt, 0.4in margins)
 DANGER_MIN = 121       # 121–165 → orphan zone: >1 line but second line is < half full
 DANGER_MAX = 165
 
-_SYSTEM = """\
-You are fixing resume bullet points that have an "orphan word" problem.
-At 10.5pt Times New Roman with 0.4in margins, one line fits ~123 characters.
-A bullet in the 121–165 character range renders as one full line plus a tiny
-second line with only 1–3 words — this looks bad on a resume.
+LAST_LINE_ORPHAN_RATIO = 0.30  # last line < 30% of content width = orphan tail
 
-For each bullet, rewrite it to EITHER:
-  a) ≤ 120 characters: trim words from the end until it fits cleanly on one line.
-     Prefer cutting filler phrases ("ensuring that...", "in order to...").
-     KEEP all numbers, percentages, and key outcomes.
-  b) ≥ 200 characters: expand with method, context, or impact detail so the
-     second line is meaningfully full (at least half a line of real content).
 
-Rules:
-- Do NOT change the meaning, facts, or quantitative claims.
+class OrphanCategory(str, Enum):
+    CLEAN = "clean"
+    TWO_LINE_ORPHAN = "two_line_orphan"
+    THREE_LINE_ORPHAN = "three_line_orphan"
+    THREE_LINE_FULL = "three_line_full"
+
+
+def classify_bullets(geometry: dict[str, BulletGeometry]) -> dict[str, OrphanCategory]:
+    """Categorize each bullet by its rendered geometry."""
+    out: dict[str, OrphanCategory] = {}
+    for bid, g in geometry.items():
+        if g.line_count <= 1:
+            out[bid] = OrphanCategory.CLEAN
+        elif g.line_count == 2:
+            if g.last_line_ratio < LAST_LINE_ORPHAN_RATIO:
+                out[bid] = OrphanCategory.TWO_LINE_ORPHAN
+            else:
+                out[bid] = OrphanCategory.CLEAN
+        else:  # 3+ lines: every wasted line costs page space
+            if g.last_line_ratio < LAST_LINE_ORPHAN_RATIO:
+                out[bid] = OrphanCategory.THREE_LINE_ORPHAN
+            else:
+                out[bid] = OrphanCategory.THREE_LINE_FULL
+    return out
+
+
+def detect_orphans_geometry(resume: Resume) -> dict[str, OrphanCategory]:
+    """Render and categorize bullets; returns only non-CLEAN bullets.
+
+    Returns {} if rendering fails — callers should fall back to detect_orphans.
+    """
+    from harness.validators.page_fit import measure_bullet_geometry
+    geom = measure_bullet_geometry(resume)
+    if not geom:
+        return {}
+    classified = classify_bullets(geom)
+    return {bid: cat for bid, cat in classified.items() if cat is not OrphanCategory.CLEAN}
+
+_BIAS_HIGH = (
+    "PAGE IS {pct}% FULL — for [TWO_LINE_ORPHAN] bullets, strongly prefer expanding to ≥200 chars. "
+    "Only trim to ≤120 as a last resort when there is genuinely no detail to add. "
+    "Never put TYPE A bullets in drop_ids — they must appear in rewrites."
+)
+_BIAS_LOW = (
+    "PAGE IS {pct}% FULL — for [TWO_LINE_ORPHAN] bullets, prefer trimming to ≤120 chars."
+)
+_BIAS_NEUTRAL = (
+    "For [TWO_LINE_ORPHAN] bullets, choose based on content richness: expand to ≥200 if the "
+    "bullet has a method or process worth showing; trim to ≤120 if it is already complete."
+)
+
+_SYSTEM_TEMPLATE = """\
+You are post-processing a one-page resume. Fix two types of bullets in one pass:
+
+TYPE A — ORPHAN BULLETS (all must be fixed). Each bullet has an action tag:
+  • [TWO_LINE_ORPHAN] = renders as 2 lines with a tiny tail. Either:
+      - trim to ≤120 chars (clean 1-liner), OR
+      - expand to ≥200 chars (full 2-liner) — add method, context, or scope.
+{bias_instruction}
+  • [THREE_LINE_ORPHAN] = renders as 3+ lines with a tiny tail. MUST trim to ≤240 chars
+    (clean 2-liner). Do NOT expand. Every wasted line costs page space.
+  • [THREE_LINE_FULL] = renders as 3+ lines with a full last line. MUST trim to ≤240 chars
+    (clean 2-liner). Do NOT expand.
+
+TYPE B — OVERFLOW CANDIDATES (trim or drop to recover page space):
+The resume overflows onto page 2. These are the lowest-value bullets.
+For each, try trimming to ≤120 chars first — saving one line often fixes the overflow.
+Only add a bullet to drop_ids if trimming would gut its core meaning entirely.
+Prefer keeping a shorter bullet over dropping it.
+
+Rules (all types):
+- Do NOT change meaning, facts, or quantitative claims.
 - Do NOT add fabricated details.
-- Prefer option (b) — expand to a full two-liner — add method, context, or scope detail using only facts already in the bullet. Only fall back to option (a) if there is genuinely no additional detail to add.
-- Return only the rewritten text strings, one per bullet, in the same order.
+- 1-liner targets are ≤120 chars. 2-liner targets are ≥200 and ≤240 chars.
 """
 
 _PROMPT = """\
-Rewrite the following bullets to fix orphan words (each must be ≤120 OR ≥200 characters):
+Fix the following resume bullets.
 
-{bullets_json}
+TYPE A — ORPHAN BULLETS (action tag in [brackets] — see system prompt):
+{orphan_json}
 
-Return a JSON array of strings, one rewritten bullet per item, in the same order.
-Count characters carefully before returning.
+TYPE B — OVERFLOW CANDIDATES (trim to ≤120 chars, or drop if trimming guts the meaning):
+{overflow_json}
+
+Return a JSON object with exactly two keys:
+  "rewrites": array of {{id, text}} for every bullet you are keeping (rewritten text)
+  "drop_ids": array of bullet ids you are dropping (TYPE B only, when trim is not viable)
+
+Every TYPE A bullet must appear in "rewrites".
+Every TYPE B bullet must appear in either "rewrites" or "drop_ids".
+Count characters carefully — respect each bullet's action tag.
 """
 
 
+class _BulletRewrite(BaseModel):
+    id: str = Field(description="Bullet id")
+    text: str = Field(description="Rewritten bullet text")
+
+
 class _FixResult(BaseModel):
-    bullets: list[str] = Field(description="Rewritten bullet texts in original order.")
+    rewrites: list[_BulletRewrite] = Field(
+        description="Kept bullets with rewritten text (≤120 or ≥200 chars each)."
+    )
+    drop_ids: list[str] = Field(
+        default_factory=list,
+        description="IDs of TYPE B bullets to drop (only when trimming guts the meaning).",
+    )
 
 
 def detect_orphans(resume: Resume) -> list[str]:
-    """Return bullet ids in the danger zone (96–130 chars)."""
+    """Return bullet ids in the danger zone (121–165 chars)."""
     return [b.id for b in iter_bullets(resume) if DANGER_MIN <= len(b.text) <= DANGER_MAX]
 
 
-def fix_orphans(resume: Resume, orphan_ids: list[str], model: ModelClient) -> Resume:
-    """Rewrite danger-zone bullets via one LLM call. Returns updated Resume."""
-    if not orphan_ids:
+def fix_bullets(
+    resume: Resume,
+    orphan_ids: list[str],
+    overflow_candidate_ids: list[str],
+    model: ModelClient,
+    *,
+    page_utilization_pct: int = 100,
+    force_expand_ids: list[str] | None = None,
+    orphan_categories: dict[str, OrphanCategory] | None = None,
+) -> Resume:
+    """Rewrite orphan bullets and trim/drop overflow candidates in one LLM call.
+
+    page_utilization_pct biases the orphan fixer: ≥90 → prefer expansion,
+    <80 → prefer trimming, 80-89 → neutral. (Bias only applies to TWO_LINE_ORPHAN;
+    THREE_LINE_* bullets must always trim.)
+
+    force_expand_ids bullets are treated as TWO_LINE_ORPHAN (expansion-eligible),
+    even if they are not in the danger zone. Used by the post-processing rescue
+    path to grow short bullets back into a 2-liner after shrinkage.
+
+    orphan_categories — when provided, drives per-bullet action tags in the
+    prompt. When None (back-compat), all orphan_ids are treated as TWO_LINE_ORPHAN.
+    """
+    force_expand = list(force_expand_ids or [])
+    if not orphan_ids and not overflow_candidate_ids and not force_expand:
         return resume
 
-    id_set = set(orphan_ids)
-    bullets_to_fix = [(b.id, b.text) for b in iter_bullets(resume) if b.id in id_set]
-    if not bullets_to_fix:
+    all_bullet_map = {b.id: b.text for b in iter_bullets(resume)}
+
+    # Treat force_expand_ids as orphans for prompt + drop-protection purposes.
+    combined_orphan_ids: list[str] = list(orphan_ids)
+    seen_orphan = set(combined_orphan_ids)
+    for bid in force_expand:
+        if bid in all_bullet_map and bid not in seen_orphan:
+            combined_orphan_ids.append(bid)
+            seen_orphan.add(bid)
+
+    cats = dict(orphan_categories or {})
+    for bid in combined_orphan_ids:
+        cats.setdefault(bid, OrphanCategory.TWO_LINE_ORPHAN)
+    for bid in force_expand:
+        cats[bid] = OrphanCategory.TWO_LINE_ORPHAN
+
+    orphan_bullets = [{"id": bid, "tag": cats[bid].value.upper(), "text": all_bullet_map[bid]}
+                      for bid in combined_orphan_ids if bid in all_bullet_map]
+    overflow_bullets = [{"id": bid, "text": all_bullet_map[bid]}
+                        for bid in overflow_candidate_ids
+                        if bid in all_bullet_map and bid not in seen_orphan]
+
+    if not orphan_bullets and not overflow_bullets:
         return resume
 
-    bullets_json = json.dumps([{"id": bid, "text": text} for bid, text in bullets_to_fix], indent=2)
-    prompt = _PROMPT.format(bullets_json=bullets_json)
+    has_two_line = any(cats.get(bid) is OrphanCategory.TWO_LINE_ORPHAN
+                       for bid in combined_orphan_ids)
+    if has_two_line and page_utilization_pct >= 90:
+        bias = _BIAS_HIGH.format(pct=page_utilization_pct)
+    elif has_two_line and page_utilization_pct < 80:
+        bias = _BIAS_LOW.format(pct=page_utilization_pct)
+    else:
+        bias = _BIAS_NEUTRAL
+
+    system = _SYSTEM_TEMPLATE.format(bias_instruction=bias)
+    prompt = _PROMPT.format(
+        orphan_json=json.dumps(orphan_bullets, indent=2),
+        overflow_json=json.dumps(overflow_bullets, indent=2),
+    )
 
     try:
-        resp = model.generate_structured(system=_SYSTEM, prompt=prompt, schema=_FixResult)
-        rewrites = resp.data.bullets
+        resp = model.generate_structured(system=system, prompt=prompt, schema=_FixResult)
+        result = resp.data
     except Exception:
-        return resume  # if the call fails, keep originals
+        return resume
 
-    if len(rewrites) != len(bullets_to_fix):
-        return resume  # mismatched response, keep originals
-
-    rewrite_map = {bid: new_text for (bid, _), new_text in zip(bullets_to_fix, rewrites)}
+    rewrite_map = {rw.id: rw.text for rw in result.rewrites}
+    # TYPE A (orphan) bullets must never be dropped — guard against LLM putting them in drop_ids.
+    orphan_set = set(combined_orphan_ids)
+    drop_set = set(result.drop_ids) - orphan_set
 
     data = resume.model_dump()
     for key in ("experience", "education", "projects"):
         for section in data[key]:
-            for bullet in section["bullets"]:
-                if bullet["id"] in rewrite_map:
-                    bullet["text"] = rewrite_map[bullet["id"]]
+            section["bullets"] = [
+                {**b, "text": rewrite_map[b["id"]]} if b["id"] in rewrite_map
+                else b
+                for b in section["bullets"]
+                if b["id"] not in drop_set
+            ]
     return Resume.model_validate(data)
+
+
+class _CleanRewrite(BaseModel):
+    text: str = Field(description="Cleanly-ending bullet within the char budget")
+
+
+def llm_clean_truncated(
+    original: str,
+    truncated: str,
+    target_max_chars: int,
+    model: ModelClient,
+) -> str | None:
+    """Have the LLM rewrite a mechanically-truncated bullet to end cleanly.
+
+    Returns None if the model call fails. Caller should fall back to the
+    truncated text in that case.
+    """
+    system = (
+        f"A resume bullet was mechanically shortened and may now end mid-clause. "
+        f"Rewrite it to end with proper punctuation, preserving all numbers, "
+        f"percentages, and facts from the original. "
+        f"The rewrite must be ≤ {target_max_chars} chars."
+    )
+    prompt = (
+        f"ORIGINAL (full meaning): {original}\n"
+        f"TRUNCATED (what was cut to): {truncated}\n\n"
+        f"Return a clean rewrite ≤ {target_max_chars} chars that ends at a "
+        f"natural clause boundary with proper punctuation."
+    )
+    try:
+        resp = model.generate_structured(system=system, prompt=prompt, schema=_CleanRewrite)
+        result = resp.data
+        if len(result.text) <= target_max_chars:
+            return result.text
+        # LLM ignored the budget — fall back
+        return None
+    except Exception:
+        return None
+
+
+def fix_orphans(
+    resume: Resume,
+    orphan_ids: list[str],
+    model: ModelClient,
+    *,
+    page_utilization_pct: int = 100,
+) -> Resume:
+    """Backwards-compatible wrapper: fix only orphan bullets, no overflow candidates."""
+    return fix_bullets(resume, orphan_ids, [], model, page_utilization_pct=page_utilization_pct)
