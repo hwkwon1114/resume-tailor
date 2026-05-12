@@ -197,10 +197,22 @@ def fix_bullets(
                        for bid in combined_orphan_ids)
     if has_two_line and page_utilization_pct >= 90:
         bias = _BIAS_HIGH.format(pct=page_utilization_pct)
+        _bias_name = "HIGH (expand-favored)"
     elif has_two_line and page_utilization_pct < 80:
         bias = _BIAS_LOW.format(pct=page_utilization_pct)
+        _bias_name = "LOW (trim-favored)"
     else:
         bias = _BIAS_NEUTRAL
+        _bias_name = "NEUTRAL"
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "[fix_bullets] bias=%s util=%d%% orphans=%d (TWO_LINE=%d THREE_LINE=%d) overflow_cands=%d",
+        _bias_name, page_utilization_pct, len(combined_orphan_ids),
+        sum(1 for bid in combined_orphan_ids if cats.get(bid) is OrphanCategory.TWO_LINE_ORPHAN),
+        sum(1 for bid in combined_orphan_ids
+            if cats.get(bid) in (OrphanCategory.THREE_LINE_ORPHAN, OrphanCategory.THREE_LINE_FULL)),
+        len(overflow_bullets),
+    )
 
     system = _SYSTEM_TEMPLATE.format(bias_instruction=bias)
     prompt = _PROMPT.format(

@@ -105,6 +105,87 @@ def test_orchestrator_runs_against_stub_no_concrete_model_imports():
     assert not leaked, f"orchestrator leaked concrete model imports: {leaked}"
 
 
+def _flagged_audit(out: Resume, flagged_bullet_id: str) -> _AuditReport:
+    """Audit report where one specific bullet is flagged (below THRESHOLD), rest are clean."""
+    from harness.judges.fabrication_audit import THRESHOLD
+    audits = []
+    for key in ("experience", "education", "projects"):
+        for section in out.model_dump()[key]:
+            for b in section["bullets"]:
+                if b["id"] == flagged_bullet_id:
+                    audits.append({
+                        "bullet_id": b["id"],
+                        "support_score": THRESHOLD - 0.1,
+                        "reason": "introduces 'InDesign', not in cited inputs",
+                    })
+                else:
+                    audits.append({"bullet_id": b["id"], "support_score": 1.0, "reason": "echo"})
+    return _AuditReport.model_validate({"audits": audits})
+
+
+def test_fabrication_audit_triggers_retry_and_records_flag():
+    """A flagged bullet on attempt 0 triggers a retry — the flag is recorded into trajectory + feedback.
+
+    Uses a small single-role fixture so the only retry trigger is fabrication
+    (mechanical + page-fit + jd-coverage all pass on a minimal resume).
+    """
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+    flagged_id = good.experience[0].bullets[0].id
+
+    # Attempt 0 flagged → must RETRY. Provide enough queue depth so the retry can run.
+    model = _SequenceModel(
+        resume_queue=[good, good, good, good],
+        audit_queue=[_flagged_audit(good, flagged_id), _good_audit(good),
+                     _good_audit(good), _good_audit(good)],
+    )
+    result = run(jd="python", input_resume=inp, model=model, max_retries=3)
+
+    # Attempt 0 must have recorded the flag.
+    assert len(result.trajectory) >= 1
+    rec0 = result.trajectory[0]
+    assert rec0.fabrication_result is not None, "attempt 0 must record a fabrication_result"
+    assert len(rec0.fabrication_result.flagged_bullets) == 1, (
+        f"attempt 0 should have exactly 1 flagged bullet, got "
+        f"{len(rec0.fabrication_result.flagged_bullets)}"
+    )
+    assert rec0.fabrication_result.flagged_bullets[0].bullet_id == flagged_id
+
+    # The flag must propagate into the retry feedback so the LLM sees it on attempt 1.
+    assert rec0.feedback.fabrication_flagged, (
+        "flagged bullets must be rendered into FeedbackMessage.fabrication_flagged"
+    )
+    assert rec0.feedback.fabrication_flagged[0]["bullet_id"] == flagged_id
+
+    # The retry must have actually fired (attempt 1 exists).
+    assert len(result.trajectory) >= 2, "flagged attempt 0 must trigger at least one retry"
+
+
+def test_fabrication_audit_clean_audit_does_not_trigger_retry():
+    """Sanity check: when fabrication audit is clean, it does not BY ITSELF force a retry.
+
+    Uses max_retries=0 to disable the page_underutilized retry gate (which fires on
+    the small fixture because it can't fill 90% of a US Letter page). With retries
+    disabled, the only retry signal we exercise is fabrication, so a clean audit ⇒
+    no retry attempted ⇒ trajectory length == 1.
+    """
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+    model = _SequenceModel(
+        resume_queue=[good],
+        audit_queue=[_good_audit(good)],
+    )
+    result = run(jd="python", input_resume=inp, model=model, max_retries=0)
+    assert len(result.trajectory) == 1, (
+        f"clean audit + max_retries=0 should exit on attempt 0; "
+        f"got {len(result.trajectory)} attempts"
+    )
+    # The trajectory's only attempt must record a non-None, non-flagged audit result.
+    rec0 = result.trajectory[0]
+    assert rec0.fabrication_result is not None
+    assert not rec0.fabrication_result.flagged_bullets, "no bullets should be flagged"
+
+
 def test_retry_budget_cap_with_always_failing_model():
     """AC-10: orchestrator stops after max_retries+1 attempts and returns a partial result."""
     inp = _load()
@@ -254,6 +335,59 @@ def test_trim_for_page_fit_skills_floor_at_8():
 
     # Skills floor at 8, so at most 2 pops, then iterations spent dropping bullets.
     assert len(result.skills) == 8, f"expected skills floor at 8, got {len(result.skills)}"
+
+
+def test_trim_for_page_fit_iteration_cap_must_cover_skill_floor_plus_bullet_drops():
+    """Regression for the 2-page-leak observed in trial_03 of the 10-trial repro.
+
+    When the overflowing content lives in a section without data-bullet-id (e.g.
+    Skills), PageFitValidator returns overflow_bullet_ids=[] and the trim loop
+    falls into the skill-pop branch — one skill per iteration. With realistic
+    inputs (the project's me.json fixture seeds 14–16 skills) and floor=8, the
+    loop needs ≥8 iterations just to exhaust skill-popping before it can ever
+    reach the bullet-drop fallback.
+
+    max_iterations=5 (the value the call site used to pass) is insufficient: the
+    loop pops 5 skills, hits its cap, and returns a still-overflowing resume —
+    the 2-page leak. max_iterations=30 (the post-fix value) gives the loop
+    enough budget to pop 8 skills to the floor and then drop bullets.
+    """
+    def fixture():
+        return _resume_with_skills([f"skill-{i}" for i in range(16)], bullets_per_role=3)
+
+    def fake_pf_run(self, output):
+        # Permanent overflow with empty overflow_ids — simulates skills (or
+        # any non-bullet-tagged content) spilling onto page 2.
+        return ValidationResult(
+            name="page_fit", passed=False, score=0.5, errors=["overflow"],
+            payload={"pages": 2, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 100},
+        )
+
+    # --- Pre-fix repro: max_iterations=5 cannot reach the bullet-drop branch.
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        buggy = _trim_for_page_fit(fixture(), fixture(), "jd", [], max_iterations=5)
+    assert len(buggy.skills) == 11, (
+        f"trial_03 repro: max_iterations=5 should pop only 5 skills (16→11); "
+        f"got {len(buggy.skills)}"
+    )
+    assert len(buggy.experience[0].bullets) == 3, (
+        "trial_03 repro: with max_iterations=5 the loop must never reach "
+        "the bullet-drop branch (this is the bug)"
+    )
+
+    # --- Post-fix: max_iterations=30 (the call-site value) reaches bullet drops.
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        fixed = _trim_for_page_fit(fixture(), fixture(), "jd", [], max_iterations=30)
+    assert len(fixed.skills) == 8, (
+        f"fix: max_iterations=30 should let skills hit floor=8; got {len(fixed.skills)}"
+    )
+    # Bullet drops + _drop_empty_sections: dropping 2 of 3 bullets leaves 1,
+    # which is below the 2-bullet minimum, so the whole role is removed.
+    assert len(fixed.experience) == 0, (
+        "fix: max_iterations=30 must reach the bullet-drop branch — the "
+        "1-role fixture loses its role once bullets fall below the 2-minimum"
+    )
 
 
 # Bug #3: shortest-bullet rescue when post-processing shrinks the page.

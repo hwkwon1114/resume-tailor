@@ -106,6 +106,9 @@ def main() -> None:
     pdf = render_to_pdf(result.final_resume)
     out_path.write_bytes(pdf)
     print(f"PDF saved → {out_path}")
+    json_path = out_path.with_suffix(".json")
+    json_path.write_text(result.final_resume.model_dump_json(indent=2))
+    print(f"JSON saved → {json_path}")
 
 
 if __name__ == "__main__":

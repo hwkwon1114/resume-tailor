@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from harness.generate import FeedbackMessage, generate
+from harness.judges.fabrication_audit import (
+    THRESHOLD as FABRICATION_THRESHOLD,
+    FabricationAudit,
+    FabricationAuditResult,
+)
 from harness.judges.jd_coverage_judge import JDCoverageJudge, JDCoverageResult
 from harness.judges.orphan_fixer import (
     SINGLE_LINE_MAX,
@@ -76,6 +81,7 @@ class RetryRecord:
     jd_coverage_result: JDCoverageResult | None
     voice_result: VoiceCheckResult | None
     feedback: FeedbackMessage
+    fabrication_result: FabricationAuditResult | None = None
 
 
 @dataclass(slots=True)
@@ -102,6 +108,7 @@ def run(
     last_resume: Resume | None = None
     last_jd_cov: JDCoverageResult | None = None
     last_voice: VoiceCheckResult | None = None
+    last_fab: FabricationAuditResult | None = None
     last_generate_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
@@ -163,20 +170,44 @@ def run(
         voice_result = VoiceCheck().run(input_resume=input_resume, output_resume=candidate)
         last_voice = voice_result
 
-        feedback = _build_feedback(validator_results, jd_cov_result)
+        # FabricationAudit — LLM-as-judge per-bullet support scoring.
+        # Strict policy: ANY bullet below FABRICATION_THRESHOLD triggers a retry.
+        if progress:
+            progress("fabrication_audit", {"attempt": attempt})
+        fab_result: FabricationAuditResult | None = None
+        try:
+            fab_result = FabricationAudit().run(
+                input_resume=input_resume, output_resume=candidate, model=judge_client
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
+        last_fab = fab_result
+
+        feedback = _build_feedback(validator_results, jd_cov_result, fab_result)
         trajectory.append(RetryRecord(
             attempt=attempt,
             validator_results=validator_results,
             jd_coverage_result=jd_cov_result,
             voice_result=voice_result,
             feedback=feedback,
+            fabrication_result=fab_result,
         ))
 
         jd_passed = jd_cov_result is None or jd_cov_result.passed
-        _will_exit = mechanical_passed and jd_passed and not page_underutilized and not page_overflowed
+        # Strict fabrication policy: any flagged bullet (score < THRESHOLD) fails the attempt.
+        # If the audit itself failed (fab_result is None) we don't block — the orchestrator
+        # already treats other judge failures as informational rather than hard failures.
+        fab_passed = fab_result is None or not fab_result.flagged_bullets
+        _will_exit = (
+            mechanical_passed and jd_passed and fab_passed
+            and not page_underutilized and not page_overflowed
+        )
         log.info(
-            "[attempt %d] decision — jd_passed=%s page_underutilized=%s page_overflowed=%s → %s",
-            attempt, jd_passed, page_underutilized, page_overflowed,
+            "[attempt %d] decision — jd_passed=%s fab_passed=%s (flagged=%d) "
+            "page_underutilized=%s page_overflowed=%s → %s",
+            attempt, jd_passed, fab_passed,
+            len(fab_result.flagged_bullets) if fab_result else 0,
+            page_underutilized, page_overflowed,
             "EXIT" if _will_exit else "RETRY",
         )
         if not _will_exit:
@@ -187,7 +218,7 @@ def run(
                 passed=True,
                 final_resume=candidate,
                 trajectory=trajectory,
-                final_metrics=_metrics(validator_results, jd_cov_result, voice_result),
+                final_metrics=_metrics(validator_results, jd_cov_result, voice_result, fab_result),
             )
 
     if last_resume is None:
@@ -200,11 +231,15 @@ def run(
         passed=False,
         final_resume=last_resume,
         trajectory=trajectory,
-        final_metrics=_metrics(trajectory[-1].validator_results, last_jd_cov, last_voice),
+        final_metrics=_metrics(trajectory[-1].validator_results, last_jd_cov, last_voice, last_fab),
     )
 
 
-def _build_feedback(validators: list[ValidationResult], jd_cov: JDCoverageResult | None) -> FeedbackMessage:
+def _build_feedback(
+    validators: list[ValidationResult],
+    jd_cov: JDCoverageResult | None,
+    fab: FabricationAuditResult | None = None,
+) -> FeedbackMessage:
     fb = FeedbackMessage()
     by_name = {v.name: v for v in validators}
 
@@ -226,6 +261,11 @@ def _build_feedback(validators: list[ValidationResult], jd_cov: JDCoverageResult
     if jd_cov is not None and not jd_cov.passed:
         fb.jd_coverage_score = round(jd_cov.score, 3)
         fb.jd_coverage_missing = list(jd_cov.uncovered_requirements[:15])
+    if fab is not None and fab.flagged_bullets:
+        fb.fabrication_flagged = [
+            {"bullet_id": a.bullet_id, "score": round(a.support_score, 2), "reason": a.reason}
+            for a in fab.flagged_bullets
+        ]
     return fb
 
 
@@ -244,6 +284,10 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
     # Step 1: assess page fit and identify candidates — no drops yet.
     pf = PageFitValidator().run(resume)
     util = pf.payload.get("page_utilization_pct", 100)
+    log.info(
+        "[post-proc/0:incoming] pages=%d util=%d%% skills=%d",
+        pf.payload.get("pages", 1), util, len(resume.skills),
+    )
 
     overflow_candidate_ids: list[str] = []
     if not pf.passed:
@@ -260,10 +304,22 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
         # Geometry unavailable (render failed / no weasyprint) — fall back to char-based.
         orphans = detect_orphans(resume)
     if orphans or overflow_candidate_ids:
+        log.info(
+            "[post-proc/1:before_llm_fix] orphans=%d overflow_cands=%d util_at_call=%d%%",
+            len(orphans), len(overflow_candidate_ids), util,
+        )
         resume = fix_bullets(
             resume, orphans, overflow_candidate_ids, model,
             page_utilization_pct=util,
             orphan_categories=orphan_cats or None,
+        )
+        _pf_after_llm = PageFitValidator().run(resume)
+        log.info(
+            "[post-proc/2:after_llm_fix] pages=%d util=%d%% skills=%d (Δpages from incoming: %+d)",
+            _pf_after_llm.payload.get("pages", 1),
+            _pf_after_llm.payload.get("page_utilization_pct", 100),
+            len(resume.skills),
+            _pf_after_llm.payload.get("pages", 1) - pf.payload.get("pages", 1),
         )
         # Re-measure after the LLM pass; any bullet still 3+ lines gets mechanically shrunk.
         post_cats = detect_orphans_geometry(resume)
@@ -280,8 +336,27 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
 
     # Step 3: mechanical drop fallback — only if the LLM pass was not enough.
     pf2 = PageFitValidator().run(resume)
+    log.info(
+        "[post-proc/3:after_shrink_loop] pages=%d util=%d%% passed=%s",
+        pf2.payload.get("pages", 1),
+        pf2.payload.get("page_utilization_pct", 100),
+        pf2.passed,
+    )
     if not pf2.passed:
-        resume = _trim_for_page_fit(resume, input_resume, jd, [], max_iterations=5)
+        log.info("[post-proc/4:invoking_mechanical_trim] pages_before=%d", pf2.payload.get("pages", 1))
+        # max_iterations must exceed (starting_skills - _SKILLS_FLOOR) so the loop
+        # can exhaust skill-popping AND reach the bullet-drop branch. With up to
+        # ~16 starting skills and floor=8, 8 iterations are needed before a single
+        # bullet drop is even possible; 30 leaves comfortable headroom for the
+        # subsequent bullet-drop phase. See trial_03 in .omc/debug/2page_repro/.
+        resume = _trim_for_page_fit(resume, input_resume, jd, [], max_iterations=30)
+        _pf_after_trim = PageFitValidator().run(resume)
+        log.info(
+            "[post-proc/5:after_mechanical_trim] pages=%d util=%d%% passed=%s",
+            _pf_after_trim.payload.get("pages", 1),
+            _pf_after_trim.payload.get("page_utilization_pct", 100),
+            _pf_after_trim.passed,
+        )
 
     # Bug #3: post-processing may shrink the page (drops, 2-liner→1-liner).
     # If util fell significantly and there are clean 1-liners we could grow back
@@ -304,7 +379,17 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
 
     exp_summary = [(e.employer, len(e.bullets)) for e in resume.experience]
     total_bullets = sum(b for _, b in exp_summary) + sum(len(p.bullets) for p in resume.projects)
-    log.info("post-processing final — exp: %s | total bullets: %d | util: %s%%", exp_summary, total_bullets, final_util)
+    final_pages = pf3.payload.get("pages", 1)
+    log.info(
+        "[post-proc/6:final] pages=%d util=%d%% passed=%s exp=%s total_bullets=%d skills=%d",
+        final_pages, final_util, pf3.passed, exp_summary, total_bullets, len(resume.skills),
+    )
+    if final_pages > 1:
+        log.warning(
+            "[post-proc/FINAL_OVERFLOW] resume still %d pages after all fallbacks — "
+            "this is the 2-page-leak bug",
+            final_pages,
+        )
     return resume
 
 
@@ -547,10 +632,18 @@ def _trim_for_page_fit(
         return max(input_scores.get(sid, 0.0) for sid in source_ids)
 
     current = candidate
+    iter_count = 0
+    skills_popped = 0
+    bullets_dropped = 0
     for _ in range(max_iterations):
+        iter_count += 1
         # Re-validate page fit on the current candidate.
         pf_result = PageFitValidator().run(current)
         if pf_result.passed:
+            log.info(
+                "[trim_for_page_fit] CONVERGED at iter=%d skills_popped=%d bullets_dropped=%d",
+                iter_count, skills_popped, bullets_dropped,
+            )
             return current
         live_overflow = pf_result.payload.get("overflow_bullet_ids") or []
 
@@ -560,6 +653,7 @@ def _trim_for_page_fit(
         # "8–14 skills total" guidance.
         if not live_overflow and len(current.skills) > _SKILLS_FLOOR:
             current = _pop_last_skill(current)
+            skills_popped += 1
             continue
 
         # Score every bullet in the current resume.
@@ -584,6 +678,12 @@ def _trim_for_page_fit(
         drop_id = scored[0][0]
         current = _prune_bullets(current, {drop_id})
         current = _drop_empty_sections(current)  # clean up roles emptied by pruning
+        bullets_dropped += 1
+    log.warning(
+        "[trim_for_page_fit] EXHAUSTED %d iterations — skills_popped=%d bullets_dropped=%d "
+        "remaining skills=%d (likely cause of 2-page output)",
+        max_iterations, skills_popped, bullets_dropped, len(current.skills),
+    )
     return current
 
 
@@ -603,7 +703,7 @@ def _pop_last_skill(resume: Resume) -> Resume:
     return Resume.model_validate(data)
 
 
-def _metrics(validators, jd_cov, voice) -> dict[str, Any]:
+def _metrics(validators, jd_cov, voice, fab=None) -> dict[str, Any]:
     by_name = {v.name: v for v in validators}
     jd_score = jd_cov.score if jd_cov is not None else (
         by_name["jd_coverage"].score if by_name.get("jd_coverage") else None
@@ -617,4 +717,6 @@ def _metrics(validators, jd_cov, voice) -> dict[str, Any]:
         "jd_coverage": round(jd_score, 3) if jd_score is not None else None,
         "voice_drift_mean": round(voice.mean_drift, 3) if voice is not None else None,
         "voice_drift_max": round(voice.max_drift, 3) if voice is not None else None,
+        "fabrication_pass_rate": round(fab.pass_rate, 3) if fab is not None else None,
+        "fabrication_flagged_count": len(fab.flagged_bullets) if fab is not None else None,
     }

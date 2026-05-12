@@ -54,7 +54,7 @@ class FabricationAudit:
             cited = [{"id": sid, "text": input_bullets.get(sid, "<UNKNOWN>")} for sid in b.source_ids]
             items.append({"bullet_id": b.id, "output_text": b.text, "cited_inputs": cited})
 
-        system = load_prompt("system_judge")
+        system = load_prompt("system_fabrication_judge")
         prompt = (
             "Audit each output bullet against its cited input bullets. "
             "Return a JSON object {\"audits\": [{bullet_id, support_score, reason}, ...]} "
