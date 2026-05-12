@@ -12,6 +12,7 @@ from harness.judges.fabrication_audit import _AuditReport
 from harness.models import EchoModelClient, ModelResponse
 from harness.orchestrator import (
     _ensure_clean_ending,
+    _finalize_metrics,
     _fix_and_trim_orphans,
     _iterative_shrink_to_fit,
     _mechanical_trim_orphans,
@@ -159,6 +160,68 @@ def test_fabrication_audit_triggers_retry_and_records_flag():
 
     # The retry must have actually fired (attempt 1 exists).
     assert len(result.trajectory) >= 2, "flagged attempt 0 must trigger at least one retry"
+
+
+def _stale_validator_results(pages: int = 2, util: int = 100) -> list[ValidationResult]:
+    """Build a validator_results list with a STALE page_fit entry (simulates pre-post-proc state)."""
+    return [
+        ValidationResult(name="schema_check", passed=True, score=1.0, errors=[], payload={}),
+        ValidationResult(name="source_attribution", passed=True, score=1.0, errors=[], payload={}),
+        ValidationResult(name="field_lock", passed=True, score=1.0, errors=[], payload={}),
+        ValidationResult(
+            name="page_fit", passed=pages == 1, score=1.0 if pages == 1 else 0.5,
+            errors=[] if pages == 1 else ["overflow"],
+            payload={
+                "pages": pages, "overflow_bullet_ids": [],
+                "font_substituted": False, "page_utilization_pct": util,
+            },
+        ),
+    ]
+
+
+def test_finalize_metrics_substitutes_post_proc_page_fit_into_metrics():
+    """Stale validator_results said pages=2, post-proc trimmed to 1 → metrics show pages=1, passed=True."""
+    resume = _resume_with_skills(["Python"], bullets_per_role=2)
+    stale = _stale_validator_results(pages=2, util=100)  # what the loop saw on its last attempt
+
+    def post_proc_pf(self, output):
+        # Post-processing trimmed the resume to 1 page at 92% utilization.
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 92},
+        )
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", post_proc_pf):
+        metrics, pf_passed = _finalize_metrics(resume, stale, None, None, None)
+
+    assert pf_passed is True, "post-proc reduced to 1 page → passed=True"
+    assert metrics["page_fit_pages"] == 1, (
+        f"metrics must reflect POST-proc state (pages=1), not stale loop state (pages=2); "
+        f"got {metrics['page_fit_pages']}"
+    )
+
+
+def test_finalize_metrics_reports_passed_false_when_post_proc_fails_to_fix_overflow():
+    """Even on the success path (`if _will_exit`), if post-proc can't rescue overflow, passed=False."""
+    resume = _resume_with_skills(["Python"], bullets_per_role=2)
+    stale = _stale_validator_results(pages=2, util=100)  # loop exited optimistically on last attempt
+
+    def post_proc_pf(self, output):
+        # Post-processing failed to fully rescue — still 2 pages.
+        return ValidationResult(
+            name="page_fit", passed=False, score=0.5, errors=["still overflowing"],
+            payload={"pages": 2, "overflow_bullet_ids": ["exp-0-out-0"],
+                     "font_substituted": False, "page_utilization_pct": 100},
+        )
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", post_proc_pf):
+        metrics, pf_passed = _finalize_metrics(resume, stale, None, None, None)
+
+    assert pf_passed is False, (
+        "post-proc could not rescue overflow → passed must be False (no silent 2-page shipping)"
+    )
+    assert metrics["page_fit_pages"] == 2
 
 
 def test_fabrication_audit_clean_audit_does_not_trigger_retry():

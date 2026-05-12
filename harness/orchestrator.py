@@ -146,7 +146,7 @@ def run(
         _pf_result = next((v for v in validator_results if v.name == "page_fit"), None)
         _util_pct = _pf_result.payload.get("page_utilization_pct", 100) if _pf_result else 100
         _pages = _pf_result.payload.get("pages", 1) if _pf_result else 1
-        page_underutilized = _util_pct < 90 and attempt < max_retries
+        page_underutilized = _util_pct < 95 and attempt < max_retries
         page_overflowed = _pages > 1 and attempt < max_retries
         log.info(
             "[attempt %d] page_fit — pages=%s util=%d%% underutilized=%s mechanical_passed=%s",
@@ -214,11 +214,17 @@ def run(
             log.info("[attempt %d] feedback:\n%s", attempt, feedback.render() if not feedback.is_empty() else "(empty)")
         if _will_exit:
             candidate = _fix_and_trim_orphans(candidate, judge_client, input_resume, jd)
+            metrics, pf_passed_after_postproc = _finalize_metrics(
+                candidate, validator_results, jd_cov_result, voice_result, fab_result
+            )
+            # passed is honest about post-processing: if the orphan-fixer/trim
+            # pipeline couldn't restore page_fit (rare, but possible when the
+            # loop exited optimistically on the last attempt), passed=False.
             return OrchestratorResult(
-                passed=True,
+                passed=pf_passed_after_postproc,
                 final_resume=candidate,
                 trajectory=trajectory,
-                final_metrics=_metrics(validator_results, jd_cov_result, voice_result, fab_result),
+                final_metrics=metrics,
             )
 
     if last_resume is None:
@@ -227,12 +233,45 @@ def run(
             + (f" Last error: {last_generate_exc}" if last_generate_exc else "")
         )
     last_resume = _fix_and_trim_orphans(last_resume, judge_client, input_resume, jd)
+    metrics, _ = _finalize_metrics(
+        last_resume, trajectory[-1].validator_results, last_jd_cov, last_voice, last_fab
+    )
     return OrchestratorResult(
         passed=False,
         final_resume=last_resume,
         trajectory=trajectory,
-        final_metrics=_metrics(trajectory[-1].validator_results, last_jd_cov, last_voice, last_fab),
+        final_metrics=metrics,
     )
+
+
+def _finalize_metrics(
+    resume: Resume,
+    validator_results: list[ValidationResult],
+    jd_cov: JDCoverageResult | None,
+    voice: VoiceCheckResult | None,
+    fab: FabricationAuditResult | None,
+) -> tuple[dict[str, Any], bool]:
+    """Re-validate page_fit on the post-processed resume so metrics + passed are honest.
+
+    Post-processing (_fix_and_trim_orphans) can change page count and utilization
+    after the retry loop's last validator pass. Re-running just PageFitValidator
+    and substituting it into the validator_results lets _metrics() report the
+    state of the actual final PDF (not the pre-rescue state).
+
+    Returns (metrics_dict, page_fit_passed_after_postproc). page_fit_passed_after_postproc
+    is the canonical "did the final PDF pass page_fit" — callers use it as the
+    OrchestratorResult.passed flag so success is honest about post-processing rescue.
+
+    Only page_fit is re-run because post-processing cannot change schema,
+    source attribution, or field-lock properties (it only rewrites bullet
+    text and drops bullets — never edits employer/date fields or section ids).
+    """
+    from harness.validators.page_fit import PageFitValidator
+
+    refreshed_pf = PageFitValidator().run(resume)
+    updated = [refreshed_pf if v.name == "page_fit" else v for v in validator_results]
+    metrics = _metrics(updated, jd_cov, voice, fab)
+    return metrics, refreshed_pf.passed
 
 
 def _build_feedback(
@@ -253,10 +292,10 @@ def _build_feedback(
         if not pf.passed:
             fb.page_fit_overflow = list(pf.payload.get("overflow_bullet_ids", []))
         util = pf.payload.get("page_utilization_pct", 100)
-        if util < 85:
+        if util < 95:
             fb.page_fit_underutilized = (
                 f"Page is only {util}% full — add a 3rd or 4th experience role, "
-                "or add more bullets to existing roles, to reach ≥90% page utilization."
+                "or add more bullets to existing roles, to reach ≥95% page utilization."
             )
     if jd_cov is not None and not jd_cov.passed:
         fb.jd_coverage_score = round(jd_cov.score, 3)
