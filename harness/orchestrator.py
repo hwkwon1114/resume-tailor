@@ -82,6 +82,36 @@ class RetryRecord:
     voice_result: VoiceCheckResult | None
     feedback: FeedbackMessage
     fabrication_result: FabricationAuditResult | None = None
+    candidate: Resume | None = None
+
+
+def _attempt_score(record: RetryRecord) -> tuple[int, int, int, int, int]:
+    """Lexicographic attempt quality score; lower tuple = better.
+
+    Used by the best-of-N fallback when no attempt achieved `_will_exit`.
+    Priority order (each component is 0 = pass, 1 = fail except util):
+      1. mechanical validators (schema, source attribution, field lock)
+      2. fabrication audit (no flagged bullets)
+      3. JD coverage at or above floor
+      4. fits on one page
+      5. utilization closer to 100% (capped) — prefers higher util
+    """
+    mech_pass = all(v.passed for v in record.validator_results if v.name != "page_fit")
+    fab_pass = (
+        record.fabrication_result is None
+        or not record.fabrication_result.flagged_bullets
+    )
+    jd_pass = (record.jd_coverage_result is None or record.jd_coverage_result.passed)
+    pf = next((v for v in record.validator_results if v.name == "page_fit"), None)
+    pages = pf.payload.get("pages", 1) if pf else 1
+    util = pf.payload.get("page_utilization_pct", 0) if pf else 0
+    return (
+        0 if mech_pass else 1,
+        0 if fab_pass else 1,
+        0 if jd_pass else 1,
+        0 if pages == 1 else 1,
+        100 - min(util, 100),
+    )
 
 
 @dataclass(slots=True)
@@ -105,10 +135,6 @@ def run(
     judge_client = judge_model or model
     trajectory: list[RetryRecord] = []
     feedback = FeedbackMessage()
-    last_resume: Resume | None = None
-    last_jd_cov: JDCoverageResult | None = None
-    last_voice: VoiceCheckResult | None = None
-    last_fab: FabricationAuditResult | None = None
     last_generate_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
@@ -126,7 +152,6 @@ def run(
 
         candidate = _drop_empty_sections(gen_resp.data)
         candidate = _boost_skills_from_jd(candidate, input_resume, jd)
-        last_resume = candidate
 
         exp_summary = [(e.employer, len(e.bullets)) for e in candidate.experience]
         proj_summary = [(p.name[:30], len(p.bullets)) for p in candidate.projects]
@@ -139,14 +164,14 @@ def run(
         if progress:
             progress("validating", {"attempt": attempt})
         validator_results = run_all(output=candidate, input_resume=input_resume, jd=jd)
-        # page_fit overflow is non-blocking (post-processing trims it).
-        # Underutilization IS retried so the LLM gets explicit "add more content" feedback,
-        # but only on non-final attempts so we don't exhaust retries chasing an unfillable page.
+        # page_fit overflow is non-blocking on non-final attempts (post-processing trims it).
+        # Underutilization is a HARD gate on every attempt: a page below the 95% target is
+        # never accepted via _will_exit. The fallthrough path picks the best attempt instead.
         mechanical_passed = all(v.passed for v in validator_results if v.name != "page_fit")
         _pf_result = next((v for v in validator_results if v.name == "page_fit"), None)
         _util_pct = _pf_result.payload.get("page_utilization_pct", 100) if _pf_result else 100
         _pages = _pf_result.payload.get("pages", 1) if _pf_result else 1
-        page_underutilized = _util_pct < 95 and attempt < max_retries
+        page_underutilized = _util_pct < 95
         page_overflowed = _pages > 1 and attempt < max_retries
         log.info(
             "[attempt %d] page_fit — pages=%s util=%d%% underutilized=%s mechanical_passed=%s",
@@ -165,10 +190,8 @@ def run(
             jd_cov_result = JDCoverageJudge().run(output_resume=candidate, jd=jd, model=judge_client)
         except Exception as exc:  # noqa: BLE001
             log.warning("jd_coverage judge failed on attempt %d: %r", attempt, exc)
-        last_jd_cov = jd_cov_result
 
         voice_result = VoiceCheck().run(input_resume=input_resume, output_resume=candidate)
-        last_voice = voice_result
 
         # FabricationAudit — LLM-as-judge per-bullet support scoring.
         # Strict policy: ANY bullet below FABRICATION_THRESHOLD triggers a retry.
@@ -181,7 +204,6 @@ def run(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
-        last_fab = fab_result
 
         feedback = _build_feedback(validator_results, jd_cov_result, fab_result)
         trajectory.append(RetryRecord(
@@ -191,6 +213,7 @@ def run(
             voice_result=voice_result,
             feedback=feedback,
             fabrication_result=fab_result,
+            candidate=candidate,
         ))
 
         jd_passed = jd_cov_result is None or jd_cov_result.passed
@@ -227,18 +250,28 @@ def run(
                 final_metrics=metrics,
             )
 
-    if last_resume is None:
+    candidate_records = [r for r in trajectory if r.candidate is not None]
+    if not candidate_records:
         raise RuntimeError(
             f"All {max_retries + 1} generation attempt(s) failed without producing a candidate."
             + (f" Last error: {last_generate_exc}" if last_generate_exc else "")
         )
-    last_resume = _fix_and_trim_orphans(last_resume, judge_client, input_resume, jd)
+    best = min(candidate_records, key=_attempt_score)
+    log.info(
+        "[fallthrough] best-of-N: attempt %d selected (score=%s, last=%d)",
+        best.attempt, _attempt_score(best), candidate_records[-1].attempt,
+    )
+    best_resume = _fix_and_trim_orphans(best.candidate, judge_client, input_resume, jd)
     metrics, _ = _finalize_metrics(
-        last_resume, trajectory[-1].validator_results, last_jd_cov, last_voice, last_fab
+        best_resume,
+        best.validator_results,
+        best.jd_coverage_result,
+        best.voice_result,
+        best.fabrication_result,
     )
     return OrchestratorResult(
         passed=False,
-        final_resume=last_resume,
+        final_resume=best_resume,
         trajectory=trajectory,
         final_metrics=metrics,
     )
@@ -335,7 +368,6 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
         overflow_candidate_ids = _rank_worst_bullets(resume, input_resume, jd, n=5)
 
     # Step 2: combined LLM pass — fix orphans and trim/drop overflow candidates.
-    pre_fix_util = util
     orphan_cats = detect_orphans_geometry(resume)
     if orphan_cats:
         orphans = list(orphan_cats.keys())
@@ -398,11 +430,13 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
         )
 
     # Bug #3: post-processing may shrink the page (drops, 2-liner→1-liner).
-    # If util fell significantly and there are clean 1-liners we could grow back
-    # into 2-liners, run one expansion-biased rescue pass.
+    # Whenever the final page sits below the 95% utilization target and we still
+    # have headroom (1 page), run one expansion-biased rescue pass to grow short
+    # bullets back into 2-liners. Uses an ABSOLUTE target rather than a delta so
+    # the rescue fires consistently — not only after a large util drop.
     pf3 = PageFitValidator().run(resume)
     final_util = pf3.payload.get("page_utilization_pct", 100)
-    if pf3.passed and final_util < pre_fix_util - 5:
+    if pf3.passed and final_util < 95:
         expand_ids = _shortest_expandable_bullets(resume, n=3)
         if expand_ids:
             rescued = fix_bullets(

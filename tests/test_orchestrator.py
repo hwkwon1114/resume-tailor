@@ -227,10 +227,11 @@ def test_finalize_metrics_reports_passed_false_when_post_proc_fails_to_fix_overf
 def test_fabrication_audit_clean_audit_does_not_trigger_retry():
     """Sanity check: when fabrication audit is clean, it does not BY ITSELF force a retry.
 
-    Uses max_retries=0 to disable the page_underutilized retry gate (which fires on
-    the small fixture because it can't fill 90% of a US Letter page). With retries
-    disabled, the only retry signal we exercise is fabrication, so a clean audit ⇒
-    no retry attempted ⇒ trajectory length == 1.
+    Uses max_retries=0 so the loop budget allows exactly one attempt; the
+    page_underutilized gate fires on the small fixture (can't fill 95% of a US
+    Letter page) but cannot trigger a retry because the budget is exhausted.
+    Trajectory length must therefore equal 1, and the clean fabrication audit
+    must not have caused additional iterations.
     """
     inp = _resume_with_skills(["Python"], bullets_per_role=2)
     good = _good_tailored(inp)
@@ -264,6 +265,118 @@ def test_retry_budget_cap_with_always_failing_model():
     result = run(jd="python", input_resume=inp, model=model, max_retries=3)
     assert not result.passed
     assert len(result.trajectory) == 4  # initial + 3 retries
+
+
+# ── Underutilization gate (no escape hatch) + best-of-N selection ────────────
+
+def _pf_validation(*, pages: int, util: int) -> ValidationResult:
+    """Build a page_fit ValidationResult with the given pages/util payload."""
+    return ValidationResult(
+        name="page_fit",
+        passed=pages == 1,
+        score=1.0 if pages == 1 else 0.5,
+        errors=[] if pages == 1 else ["overflow"],
+        payload={
+            "pages": pages,
+            "overflow_bullet_ids": [],
+            "font_substituted": False,
+            "page_utilization_pct": util,
+        },
+    )
+
+
+def test_underutilized_final_attempt_no_longer_triggers_exit():
+    """Underutilization (util<95) blocks _will_exit on EVERY attempt, including the final one.
+
+    Before the escape-hatch removal, `page_underutilized` was masked off on the
+    final attempt, so the orchestrator would EXIT optimistically at any util
+    on the last try. Now the gate fires on every attempt; the loop must reach
+    the fallthrough (passed=False) instead of short-circuiting.
+
+    JDCoverageJudge is patched to None so it doesn't pop from the same resume
+    queue _SequenceModel uses for generate(); _fix_and_trim_orphans is a
+    passthrough so the test doesn't depend on post-proc LLM calls.
+    """
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+
+    # Force PageFitValidator to always report util=82 (below 95% target), 1 page.
+    def fake_pf_run(self, output):
+        return _pf_validation(pages=1, util=82)
+
+    def fake_fix(resume_in, model, input_resume, jd):
+        return resume_in
+
+    model = _SequenceModel(
+        resume_queue=[good] * 2,
+        audit_queue=[_good_audit(good)] * 2,
+    )
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", return_value=None), \
+         patch("harness.orchestrator._fix_and_trim_orphans", side_effect=fake_fix):
+        result = run(jd="python", input_resume=inp, model=model, max_retries=1)
+
+    # max_retries=1 → 2 attempts; both underutilized → no early EXIT, both attempts run.
+    assert len(result.trajectory) == 2, (
+        f"underutilized final attempt must not EXIT; expected 2 attempts, "
+        f"got {len(result.trajectory)}"
+    )
+    assert result.passed is False, (
+        "fallthrough path returns passed=False — never silently accept util<95"
+    )
+
+
+def test_best_of_n_selects_higher_util_attempt_when_final_is_worse():
+    """When no attempt achieves _will_exit, the fallthrough picks the best-scoring
+    earlier attempt, not the last attempt.
+
+    Setup: 4 underutilized attempts at util 89%/85%/80%/75%. The final attempt
+    (75%) is worst; the best-of-N scoring must select attempt 0 (89%).
+    """
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+
+    # Tag each candidate's summary so we can identify which one was selected.
+    def _tag(base: Resume, marker: str) -> Resume:
+        raw = base.model_dump()
+        raw["summary"] = marker
+        return Resume.model_validate(raw)
+
+    candidates = [_tag(good, f"ATTEMPT_{i}") for i in range(4)]
+
+    # Per-call util sequence for the 4 generate-time validations; later calls
+    # (post-processing, _finalize_metrics) fall through to a steady 75%.
+    util_seq = iter([89, 85, 80, 75])
+    def fake_pf_run(self, output):
+        try:
+            util = next(util_seq)
+        except StopIteration:
+            util = 75
+        return _pf_validation(pages=1, util=util)
+
+    # Passthrough post-proc so the selected candidate survives identifiable into final_resume.
+    def fake_fix(resume_in, model, input_resume, jd):
+        return resume_in
+
+    model = _SequenceModel(
+        resume_queue=candidates,
+        audit_queue=[_good_audit(c) for c in candidates],
+    )
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", return_value=None), \
+         patch("harness.orchestrator._fix_and_trim_orphans", side_effect=fake_fix):
+        result = run(jd="python", input_resume=inp, model=model, max_retries=3)
+
+    assert result.final_resume.summary == "ATTEMPT_0", (
+        f"best-of-N must select the highest-util attempt (ATTEMPT_0 @89%); "
+        f"got summary={result.final_resume.summary!r}"
+    )
+    assert len(result.trajectory) == 4, "all 4 attempts must have run"
+    assert result.passed is False, "all attempts underutilized → passed=False"
+    # The trajectory must carry the per-attempt candidate so best-of-N can replay.
+    assert all(r.candidate is not None for r in result.trajectory), (
+        "every successful attempt must record its candidate in trajectory"
+    )
 
 
 # ── Bug #1, #2, #3 regression tests ──────────────────────────────────────────
