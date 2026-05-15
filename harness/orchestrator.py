@@ -436,37 +436,56 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
             _pf_after_trim.passed,
         )
 
-    # Rescue under-utilization with one expansion pass — absolute 95% target, not a delta.
+    # Iterative under-utilization rescue — try up to MAX_RESCUE_ITERATIONS expansion
+    # passes to bring util to the 95% target. Each iteration targets the n shortest
+    # 1-liner bullets (different ones each iter, since the previous iter's targets
+    # are now 2-liners and no longer qualify). Stops on: target met, overflow risk,
+    # no expandable bullets left, or zero progress between iterations.
+    MAX_RESCUE_ITERATIONS = 3
     pf3 = PageFitValidator().run(resume)
     final_util = pf3.payload.get("page_utilization_pct", 100)
-    if pf3.passed and final_util < 95:
+    for iteration in range(MAX_RESCUE_ITERATIONS):
+        if not pf3.passed or final_util >= 95:
+            break
         expand_ids = _shortest_expandable_bullets(resume, n=3)
         if not expand_ids:
-            log.info("[post-proc/rescue] skipped — no expandable 1-liner bullets (util=%d%%)", final_util)
-        else:
-            log.info("[post-proc/rescue] firing — util=%d%% expand_ids=%s", final_util, expand_ids)
-            rescued = fix_bullets(
-                resume, [], [], model,
-                page_utilization_pct=100,
-                force_expand_ids=expand_ids,
+            log.info(
+                "[post-proc/rescue iter=%d] skipped — no expandable 1-liner bullets (util=%d%%)",
+                iteration, final_util,
             )
-            rescued_pf = PageFitValidator().run(rescued)
-            rescued_util = rescued_pf.payload.get("page_utilization_pct", final_util)
-            rescued_pages = rescued_pf.payload.get("pages", 1)
-            if rescued_pf.passed:
-                log.info(
-                    "[post-proc/rescue] accepted — util %d%% → %d%% (pages=%d)",
-                    final_util, rescued_util, rescued_pages,
-                )
-                resume = rescued
-                pf3 = rescued_pf
-                final_util = rescued_util
-            else:
-                log.info(
-                    "[post-proc/rescue] rejected — expansion would overflow "
-                    "(rescued pages=%d util=%d%%); keeping pre-rescue state at util=%d%%",
-                    rescued_pages, rescued_util, final_util,
-                )
+            break
+        log.info(
+            "[post-proc/rescue iter=%d] firing — util=%d%% expand_ids=%s",
+            iteration, final_util, expand_ids,
+        )
+        rescued = fix_bullets(
+            resume, [], [], model,
+            page_utilization_pct=100,
+            force_expand_ids=expand_ids,
+        )
+        rescued_pf = PageFitValidator().run(rescued)
+        rescued_util = rescued_pf.payload.get("page_utilization_pct", final_util)
+        rescued_pages = rescued_pf.payload.get("pages", 1)
+        if not rescued_pf.passed:
+            log.info(
+                "[post-proc/rescue iter=%d] rejected — expansion would overflow "
+                "(rescued pages=%d util=%d%%); keeping pre-rescue state at util=%d%%",
+                iteration, rescued_pages, rescued_util, final_util,
+            )
+            break
+        if rescued_util <= final_util:
+            log.info(
+                "[post-proc/rescue iter=%d] no progress — util %d%% → %d%%; stopping",
+                iteration, final_util, rescued_util,
+            )
+            break
+        log.info(
+            "[post-proc/rescue iter=%d] accepted — util %d%% → %d%% (pages=%d)",
+            iteration, final_util, rescued_util, rescued_pages,
+        )
+        resume = rescued
+        pf3 = rescued_pf
+        final_util = rescued_util
 
     exp_summary = [(e.employer, len(e.bullets)) for e in resume.experience]
     total_bullets = sum(b for _, b in exp_summary) + sum(len(p.bullets) for p in resume.projects)

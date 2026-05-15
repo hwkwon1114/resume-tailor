@@ -73,8 +73,9 @@ _BIAS_LOW = (
     "PAGE IS {pct}% FULL — for [TWO_LINE_ORPHAN] bullets, prefer trimming to ≤120 chars."
 )
 _BIAS_NEUTRAL = (
-    "For [TWO_LINE_ORPHAN] bullets, choose based on content richness: expand to ≥200 if the "
-    "bullet has a method or process worth showing; trim to ≤120 if it is already complete."
+    "PAGE IS {pct}% FULL — for [TWO_LINE_ORPHAN] bullets, prefer expansion to ≥200 chars "
+    "when the bullet has authentic content to expand into. Only trim to ≤120 if the bullet "
+    "is genuinely complete as a 1-liner — do NOT trim merely to reduce length."
 )
 
 _SYSTEM_TEMPLATE = """\
@@ -204,8 +205,8 @@ def fix_bullets(
         bias = _BIAS_HIGH.format(pct=page_utilization_pct)
         _bias_name = "HIGH (expand-favored, below 95% target)"
     else:
-        bias = _BIAS_NEUTRAL
-        _bias_name = "NEUTRAL"
+        bias = _BIAS_NEUTRAL.format(pct=page_utilization_pct)
+        _bias_name = "NEUTRAL (soft expand-lean, near target)"
     import logging as _logging
     _logging.getLogger(__name__).info(
         "[fix_bullets] bias=%s util=%d%% orphans=%d (TWO_LINE=%d THREE_LINE=%d) overflow_cands=%d",

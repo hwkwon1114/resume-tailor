@@ -639,6 +639,103 @@ def test_fix_bullets_preserves_1bullet_role_at_util_94_boundary():
     )
 
 
+def test_iterative_rescue_makes_multiple_passes_when_util_climbing():
+    """When each rescue pass brings util closer to the 95% target, the rescue
+    iterates up to MAX_RESCUE_ITERATIONS (3) — not just one shot.
+
+    Locks the iterative-rescue refactor. The AWS-content-developer live run
+    landed at util=91% because the previous single-shot rescue couldn't fully
+    recover. With iteration, util can climb across multiple passes
+    (e.g. 80 → 85 → 92 → 96, stopping at target met).
+
+    Setup: PageFitValidator stub returns a climbing util sequence; fix_bullets
+    is spied (not actually run) so the climb is purely from the stub. The
+    contract under test is "how many rescue iterations fire," not what
+    fix_bullets does internally.
+    """
+    resume = _resume_with_skills(["Python"], bullets_per_role=3)
+
+    # Util sequence consumed across PageFitValidator.run() calls inside
+    # _fix_and_trim_orphans (when no orphans / no overflow):
+    #   idx 0: initial pf at function top
+    #   idx 1: pf2 after the (skipped) orphan-fix block
+    #   idx 2: pf3 just before the rescue loop
+    #   idx 3-5: rescued_pf after each of the 3 iterations
+    util_sequence = iter([80, 80, 80, 85, 92, 96])
+
+    def fake_pf_run(self, output):
+        try:
+            util = next(util_sequence)
+        except StopIteration:
+            util = 96
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": util},
+        )
+
+    fix_bullets_calls: list = []
+
+    def spy_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        fix_bullets_calls.append(kw.get("force_expand_ids"))
+        return resume_in  # unchanged; util climb comes from the pf stub
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=spy_fix_bullets):
+        _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    # Exactly 3 rescue iterations: util climbs 80→85 (iter 0), 85→92 (iter 1),
+    # 92→96 (iter 2). Loop's top-of-iter break-check `final_util >= 95` would
+    # exit iter 3 if it existed, but the for-loop bound is MAX_RESCUE_ITERATIONS=3.
+    assert len(fix_bullets_calls) == 3, (
+        f"iterative rescue should fire 3 times (util climb 80→85→92→96 across "
+        f"3 iters); got {len(fix_bullets_calls)} fix_bullets calls"
+    )
+    for i, expand_ids in enumerate(fix_bullets_calls):
+        assert expand_ids, f"rescue iter={i}: force_expand_ids should be non-empty"
+
+
+def test_iterative_rescue_stops_on_no_progress():
+    """The rescue stops iterating when an iteration produces zero util gain.
+
+    Even with budget remaining (MAX_RESCUE_ITERATIONS=3), if rescued_util ≤
+    final_util, further iterations would just waste Gemini calls. Locks the
+    no-progress early-exit.
+    """
+    resume = _resume_with_skills(["Python"], bullets_per_role=3)
+
+    # Util climbs once (80 → 85), then stalls at 85. iter 0 accepts; iter 1
+    # sees rescued_util=85 ≤ final_util=85 → breaks. Only 2 fix_bullets calls.
+    util_sequence = iter([80, 80, 80, 85, 85])
+
+    def fake_pf_run(self, output):
+        try:
+            util = next(util_sequence)
+        except StopIteration:
+            util = 85
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": util},
+        )
+
+    fix_bullets_calls: list = []
+
+    def spy_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        fix_bullets_calls.append(kw.get("force_expand_ids"))
+        return resume_in
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=spy_fix_bullets):
+        _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    assert len(fix_bullets_calls) == 2, (
+        f"rescue should bail after the first no-progress iteration; "
+        f"expected 2 fix_bullets calls (iter 0 progress 80→85, iter 1 stalls 85→85), "
+        f"got {len(fix_bullets_calls)}"
+    )
+
+
 # Bug #2: skills overflow → pop trailing skills before dropping bullets.
 def test_pop_last_skill_drops_least_important():
     resume = _resume_with_skills(["Python", "JAX", "Rust"])

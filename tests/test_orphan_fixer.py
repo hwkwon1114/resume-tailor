@@ -328,19 +328,25 @@ class _PromptCapturingModel:
         (82, "strongly prefer expanding", "prefer trimming"),   # below 95% target → HIGH
         (88, "strongly prefer expanding", "prefer trimming"),   # the old NEUTRAL band — now HIGH
         (94, "strongly prefer expanding", "prefer trimming"),   # just below target → HIGH
-        (95, "content richness", "strongly prefer expanding"),  # at target → NEUTRAL
-        (99, "content richness", "strongly prefer expanding"),  # just under 100 → NEUTRAL
+        (95, "prefer expansion", "prefer trimming"),            # at target → NEUTRAL (soft expand-lean)
+        (99, "prefer expansion", "prefer trimming"),            # just under 100 → NEUTRAL (soft expand-lean)
         (100, "prefer trimming", "strongly prefer expanding"),  # saturation/overflow → LOW
         (110, "prefer trimming", "strongly prefer expanding"),  # heavy overflow → LOW
     ],
 )
 def test_fix_bullets_bias_aligns_with_95pct_target(util_pct, expected_substr, disallowed_substr):
-    """Below 95 → expand-favored; 95-99 → neutral; ≥100 (overflow) → trim-favored.
+    """Below 95 → expand-favored; 95-99 → soft expand-lean (no longer truly neutral);
+    ≥100 (overflow) → trim-favored.
 
     Previously the band thresholds were 90/80, which left 80-89% in NEUTRAL
     (allowing the LLM to trim and worsen underutilization) and treated >=100%
-    overflow as expand-favored (which grew the overflow further). This test
-    locks the new alignment with the orchestrator's 95% target.
+    overflow as expand-favored (which grew the overflow further). The 95-99
+    NEUTRAL band was tightened to "prefer expansion" (no longer truly neutral)
+    after the AWS-content-developer live run showed the LLM trimming at util=98%
+    and dropping the page to util=91%. Test locks the bias-string substrings
+    used to communicate that policy to the LLM: HIGH = "strongly prefer
+    expanding"; NEUTRAL = "prefer expansion" (note: different word from HIGH's
+    "expanding"); LOW = "prefer trimming".
     """
     resume = _make_resume([{"id": "b0", "text": "a" * 140, "source_ids": ["src"]}])
     model = _PromptCapturingModel()
