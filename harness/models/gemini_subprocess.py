@@ -25,9 +25,7 @@ GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
 DEFAULT_TIMEOUT = 120
 
 
-def _resolve_timeout(explicit: int | None) -> int:
-    if explicit is not None:
-        return explicit
+def _read_timeout_env() -> int:
     raw = os.environ.get("GEMINI_CLI_TIMEOUT")
     if not raw:
         return DEFAULT_TIMEOUT
@@ -42,9 +40,9 @@ def _resolve_timeout(explicit: int | None) -> int:
     return value
 
 
-def _run(prompt: str, timeout: int | None = None) -> str:
+def _run(prompt: str) -> str:
     """Pipe prompt to `gemini` via stdin and return stdout."""
-    resolved = _resolve_timeout(timeout)
+    resolved = _read_timeout_env()
     try:
         result = subprocess.run(
             [GEMINI_BIN],

@@ -401,13 +401,7 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
             still_bad = detect_orphans(resume)
             if still_bad:
                 resume = _mechanical_trim_orphans(resume, still_bad, model=model)
-        # Bug #1: fix_bullets may drop bullets via drop_ids, leaving experience
-        # entries with <2 bullets. Re-enforce the structural rule — but relax
-        # the floor to 1 when we entered the call already underutilized, so the
-        # harness doesn't compound a drop by nuking the whole role at a moment
-        # it should be preserving content. The strict 2-bullet rule still
-        # applies to generation-time output (line 153) and the overflow-recovery
-        # trim loop (where dropping more is fine).
+        # Below the 95% target, preserve 1-bullet roles — dropping them would make the page emptier.
         min_floor = 1 if util < 95 else 2
         resume = _drop_empty_sections(resume, min_exp_bullets=min_floor)
 
@@ -435,11 +429,7 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
             _pf_after_trim.passed,
         )
 
-    # Bug #3: post-processing may shrink the page (drops, 2-liner→1-liner).
-    # Whenever the final page sits below the 95% utilization target and we still
-    # have headroom (1 page), run one expansion-biased rescue pass to grow short
-    # bullets back into 2-liners. Uses an ABSOLUTE target rather than a delta so
-    # the rescue fires consistently — not only after a large util drop.
+    # Rescue under-utilization with one expansion pass — absolute 95% target, not a delta.
     pf3 = PageFitValidator().run(resume)
     final_util = pf3.payload.get("page_utilization_pct", 100)
     if pf3.passed and final_util < 95:

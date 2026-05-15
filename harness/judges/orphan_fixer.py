@@ -198,15 +198,12 @@ def fix_bullets(
     has_two_line = any(cats.get(bid) is OrphanCategory.TWO_LINE_ORPHAN
                        for bid in combined_orphan_ids)
     if has_two_line and page_utilization_pct >= 100:
-        # Page is at the limit or overflowing — never bias toward growing it further.
         bias = _BIAS_LOW.format(pct=page_utilization_pct)
         _bias_name = "LOW (trim-favored, page at/over limit)"
     elif has_two_line and page_utilization_pct < 95:
-        # Below the 95% utilization target — push every orphan toward a full 2-liner.
         bias = _BIAS_HIGH.format(pct=page_utilization_pct)
         _bias_name = "HIGH (expand-favored, below 95% target)"
     else:
-        # 95 ≤ util < 100: at target with no overflow — content richness decides.
         bias = _BIAS_NEUTRAL
         _bias_name = "NEUTRAL"
     import logging as _logging
