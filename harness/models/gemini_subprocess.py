@@ -22,20 +22,39 @@ from pydantic import BaseModel, ValidationError
 from harness.models.base import ModelOutputError, ModelResponse
 
 GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
+DEFAULT_TIMEOUT = 120
 
 
-def _run(prompt: str, timeout: int = 120) -> str:
+def _resolve_timeout(explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("GEMINI_CLI_TIMEOUT")
+    if not raw:
+        return DEFAULT_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ModelOutputError(
+            f"GEMINI_CLI_TIMEOUT must be an integer (seconds), got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ModelOutputError(f"GEMINI_CLI_TIMEOUT must be positive, got {value}")
+    return value
+
+
+def _run(prompt: str, timeout: int | None = None) -> str:
     """Pipe prompt to `gemini` via stdin and return stdout."""
+    resolved = _resolve_timeout(timeout)
     try:
         result = subprocess.run(
             [GEMINI_BIN],
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=resolved,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ModelOutputError(f"Gemini CLI timed out after {timeout}s") from exc
+        raise ModelOutputError(f"Gemini CLI timed out after {resolved}s") from exc
     except FileNotFoundError as exc:
         raise ModelOutputError(
             f"Gemini CLI not found at {GEMINI_BIN}. "
