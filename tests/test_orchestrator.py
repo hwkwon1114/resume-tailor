@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -180,26 +180,62 @@ def _stale_validator_results(pages: int = 2, util: int = 100) -> list[Validation
 
 
 def test_finalize_metrics_substitutes_post_proc_page_fit_into_metrics():
-    """Stale validator_results said pages=2, post-proc trimmed to 1 → metrics show pages=1, passed=True."""
+    """Stale validator_results said pages=2, post-proc trimmed to 1 → metrics show pages=1.
+
+    Uses util=97 in the post-proc stub so the targets-met flag is True (both
+    pages==1 AND util≥95 must hold for passed=True under the post-95% contract).
+    The test's load-bearing assertion is the metrics substitution itself.
+    """
     resume = _resume_with_skills(["Python"], bullets_per_role=2)
     stale = _stale_validator_results(pages=2, util=100)  # what the loop saw on its last attempt
 
     def post_proc_pf(self, output):
-        # Post-processing trimmed the resume to 1 page at 92% utilization.
+        # Post-processing trimmed the resume to 1 page at 97% utilization.
         return ValidationResult(
             name="page_fit", passed=True, score=1.0, errors=[],
             payload={"pages": 1, "overflow_bullet_ids": [],
-                     "font_substituted": False, "page_utilization_pct": 92},
+                     "font_substituted": False, "page_utilization_pct": 97},
         )
 
     with patch("harness.validators.page_fit.PageFitValidator.run", post_proc_pf):
-        metrics, pf_passed = _finalize_metrics(resume, stale, None, None, None)
+        metrics, targets_met = _finalize_metrics(resume, stale, None, None, None)
 
-    assert pf_passed is True, "post-proc reduced to 1 page → passed=True"
+    assert targets_met is True, "post-proc landed at pages=1 util=97 → both targets met"
     assert metrics["page_fit_pages"] == 1, (
         f"metrics must reflect POST-proc state (pages=1), not stale loop state (pages=2); "
         f"got {metrics['page_fit_pages']}"
     )
+
+
+def test_finalize_metrics_reports_passed_false_when_post_proc_lands_below_95pct_util():
+    """Even when pages==1, passed must be False if final util<95.
+
+    Locks the post-95% contract: the passed flag honors the page-utilization
+    target, not just page count. Without this, a run could ship a 1-page
+    resume at e.g. 80% util while reporting Result: PASSED — exactly the
+    silent-underutilization regression observed on the AWS content-developer
+    JD run that motivated this gate.
+    """
+    resume = _resume_with_skills(["Python"], bullets_per_role=2)
+    stale = _stale_validator_results(pages=1, util=98)  # loop saw a clean state
+
+    def post_proc_pf(self, output):
+        # Post-processing kept pages=1 but trimmed bullets down to util=91 —
+        # exactly the state seen on the AWS run that exposed the gap.
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 91},
+        )
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", post_proc_pf):
+        metrics, targets_met = _finalize_metrics(resume, stale, None, None, None)
+
+    assert targets_met is False, (
+        "pages=1 but util=91 (< 95% target) must yield targets_met=False — "
+        "no silent shipping of under-utilized resumes"
+    )
+    assert metrics["page_fit_pages"] == 1, "page count is still 1"
 
 
 def test_finalize_metrics_reports_passed_false_when_post_proc_fails_to_fix_overflow():
@@ -265,6 +301,44 @@ def test_retry_budget_cap_with_always_failing_model():
     result = run(jd="python", input_resume=inp, model=model, max_retries=3)
     assert not result.passed
     assert len(result.trajectory) == 4  # initial + 3 retries
+
+
+def test_orchestrator_runs_both_judges_per_attempt():
+    """JDCoverageJudge and FabricationAudit both fire per attempt and their
+    results both land in the RetryRecord.
+
+    The orchestrator runs the two judges in parallel via ThreadPoolExecutor.
+    This test locks the *contract* (both judges always run, both results are
+    surfaced) — not the threading implementation, which can be swapped without
+    breaking the test. If parallelism were ever to silently drop one judge,
+    this test would fail.
+    """
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+
+    # Sentinel objects whose identity we can assert downstream. .passed and
+    # .flagged_bullets are set so the orchestrator's _will_exit gate evaluates
+    # them as a clean attempt, but the test isn't checking that — only that
+    # each sentinel arrives in its correct RetryRecord field.
+    sentinel_jd = MagicMock(name="jd_cov_sentinel")
+    sentinel_jd.passed = True
+    sentinel_fab = MagicMock(name="fab_sentinel")
+    sentinel_fab.flagged_bullets = []
+
+    model = _SequenceModel(resume_queue=[good], audit_queue=[])
+
+    with patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", return_value=sentinel_jd), \
+         patch("harness.judges.fabrication_audit.FabricationAudit.run", return_value=sentinel_fab):
+        result = run(jd="python", input_resume=inp, model=model, max_retries=0)
+
+    assert len(result.trajectory) == 1, f"expected 1 attempt, got {len(result.trajectory)}"
+    rec0 = result.trajectory[0]
+    assert rec0.jd_coverage_result is sentinel_jd, (
+        "JDCoverageJudge result must be wired into RetryRecord.jd_coverage_result"
+    )
+    assert rec0.fabrication_result is sentinel_fab, (
+        "FabricationAudit result must be wired into RetryRecord.fabrication_result"
+    )
 
 
 # ── Underutilization gate (no escape hatch) + best-of-N selection ────────────

@@ -14,6 +14,7 @@ Feedback replaces across attempts (no unbounded prompt growth).
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -182,28 +183,35 @@ def run(
             mechanical_passed,
         )
 
-        # JD coverage judge runs every attempt — gives semantic score + uncovered reqs for feedback.
-        if progress:
-            progress("jd_coverage_judge", {"attempt": attempt})
-        jd_cov_result: JDCoverageResult | None = None
-        try:
-            jd_cov_result = JDCoverageJudge().run(output_resume=candidate, jd=jd, model=judge_client)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("jd_coverage judge failed on attempt %d: %r", attempt, exc)
-
-        voice_result = VoiceCheck().run(input_resume=input_resume, output_resume=candidate)
-
-        # FabricationAudit — LLM-as-judge per-bullet support scoring.
+        # JDCoverageJudge and FabricationAudit are independent LLM calls on the
+        # same candidate — fan out in parallel via threads so wall-clock per
+        # attempt drops from sum(jd, fab) to max(jd, fab). subprocess.run inside
+        # GeminiSubprocessClient releases the GIL while waiting on the Gemini
+        # CLI, so threading is sufficient — no asyncio refactor needed.
         # Strict policy: ANY bullet below FABRICATION_THRESHOLD triggers a retry.
         if progress:
+            progress("jd_coverage_judge", {"attempt": attempt})
             progress("fabrication_audit", {"attempt": attempt})
+        jd_cov_result: JDCoverageResult | None = None
         fab_result: FabricationAuditResult | None = None
-        try:
-            fab_result = FabricationAudit().run(
-                input_resume=input_resume, output_resume=candidate, model=judge_client
+        with ThreadPoolExecutor(max_workers=2) as judge_pool:
+            jd_future = judge_pool.submit(
+                JDCoverageJudge().run, output_resume=candidate, jd=jd, model=judge_client
             )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
+            fab_future = judge_pool.submit(
+                FabricationAudit().run,
+                input_resume=input_resume, output_resume=candidate, model=judge_client,
+            )
+            try:
+                jd_cov_result = jd_future.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("jd_coverage judge failed on attempt %d: %r", attempt, exc)
+            try:
+                fab_result = fab_future.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
+
+        voice_result = VoiceCheck().run(input_resume=input_resume, output_resume=candidate)
 
         feedback = _build_feedback(validator_results, jd_cov_result, fab_result)
         trajectory.append(RetryRecord(
@@ -286,25 +294,24 @@ def _finalize_metrics(
 ) -> tuple[dict[str, Any], bool]:
     """Re-validate page_fit on the post-processed resume so metrics + passed are honest.
 
-    Post-processing (_fix_and_trim_orphans) can change page count and utilization
-    after the retry loop's last validator pass. Re-running just PageFitValidator
-    and substituting it into the validator_results lets _metrics() report the
-    state of the actual final PDF (not the pre-rescue state).
+    Returns (metrics_dict, targets_met). targets_met is True iff the final
+    rendered PDF meets BOTH targets: pages == 1 AND page_utilization_pct ≥ 95.
+    Callers use it as the OrchestratorResult.passed flag, so passed=True now
+    means the resume genuinely satisfies the page count AND the utilization
+    target — not just "fits on one page however empty."
 
-    Returns (metrics_dict, page_fit_passed_after_postproc). page_fit_passed_after_postproc
-    is the canonical "did the final PDF pass page_fit" — callers use it as the
-    OrchestratorResult.passed flag so success is honest about post-processing rescue.
-
-    Only page_fit is re-run because post-processing cannot change schema,
-    source attribution, or field-lock properties (it only rewrites bullet
-    text and drops bullets — never edits employer/date fields or section ids).
+    Only page_fit is re-run; post-processing cannot change schema, source
+    attribution, or field-lock properties (it only rewrites bullet text and
+    drops bullets — never edits employer/date fields or section ids).
     """
     from harness.validators.page_fit import PageFitValidator
 
     refreshed_pf = PageFitValidator().run(resume)
+    util = refreshed_pf.payload.get("page_utilization_pct", 0)
     updated = [refreshed_pf if v.name == "page_fit" else v for v in validator_results]
     metrics = _metrics(updated, jd_cov, voice, fab)
-    return metrics, refreshed_pf.passed
+    targets_met = refreshed_pf.passed and util >= 95
+    return metrics, targets_met
 
 
 def _build_feedback(
@@ -434,17 +441,32 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
     final_util = pf3.payload.get("page_utilization_pct", 100)
     if pf3.passed and final_util < 95:
         expand_ids = _shortest_expandable_bullets(resume, n=3)
-        if expand_ids:
+        if not expand_ids:
+            log.info("[post-proc/rescue] skipped — no expandable 1-liner bullets (util=%d%%)", final_util)
+        else:
+            log.info("[post-proc/rescue] firing — util=%d%% expand_ids=%s", final_util, expand_ids)
             rescued = fix_bullets(
                 resume, [], [], model,
                 page_utilization_pct=100,
                 force_expand_ids=expand_ids,
             )
             rescued_pf = PageFitValidator().run(rescued)
+            rescued_util = rescued_pf.payload.get("page_utilization_pct", final_util)
+            rescued_pages = rescued_pf.payload.get("pages", 1)
             if rescued_pf.passed:
+                log.info(
+                    "[post-proc/rescue] accepted — util %d%% → %d%% (pages=%d)",
+                    final_util, rescued_util, rescued_pages,
+                )
                 resume = rescued
                 pf3 = rescued_pf
-                final_util = pf3.payload.get("page_utilization_pct", final_util)
+                final_util = rescued_util
+            else:
+                log.info(
+                    "[post-proc/rescue] rejected — expansion would overflow "
+                    "(rescued pages=%d util=%d%%); keeping pre-rescue state at util=%d%%",
+                    rescued_pages, rescued_util, final_util,
+                )
 
     exp_summary = [(e.employer, len(e.bullets)) for e in resume.experience]
     total_bullets = sum(b for _, b in exp_summary) + sum(len(p.bullets) for p in resume.projects)
