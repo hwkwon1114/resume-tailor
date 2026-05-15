@@ -153,9 +153,11 @@ def fix_bullets(
 ) -> Resume:
     """Rewrite orphan bullets and trim/drop overflow candidates in one LLM call.
 
-    page_utilization_pct biases the orphan fixer: ≥90 → prefer expansion,
-    <80 → prefer trimming, 80-89 → neutral. (Bias only applies to TWO_LINE_ORPHAN;
-    THREE_LINE_* bullets must always trim.)
+    page_utilization_pct biases the orphan fixer:
+      - util < 95 (below the 95% page-utilization target) → prefer expansion
+      - 95 ≤ util < 100 (at target) → neutral, let content richness decide
+      - util ≥ 100 (saturates when pages > 1 — i.e. overflow) → prefer trimming
+    Bias applies only to TWO_LINE_ORPHAN; THREE_LINE_* bullets must always trim.
 
     force_expand_ids bullets are treated as TWO_LINE_ORPHAN (expansion-eligible),
     even if they are not in the danger zone. Used by the post-processing rescue
@@ -195,13 +197,16 @@ def fix_bullets(
 
     has_two_line = any(cats.get(bid) is OrphanCategory.TWO_LINE_ORPHAN
                        for bid in combined_orphan_ids)
-    if has_two_line and page_utilization_pct >= 90:
-        bias = _BIAS_HIGH.format(pct=page_utilization_pct)
-        _bias_name = "HIGH (expand-favored)"
-    elif has_two_line and page_utilization_pct < 80:
+    if has_two_line and page_utilization_pct >= 100:
+        # Page is at the limit or overflowing — never bias toward growing it further.
         bias = _BIAS_LOW.format(pct=page_utilization_pct)
-        _bias_name = "LOW (trim-favored)"
+        _bias_name = "LOW (trim-favored, page at/over limit)"
+    elif has_two_line and page_utilization_pct < 95:
+        # Below the 95% utilization target — push every orphan toward a full 2-liner.
+        bias = _BIAS_HIGH.format(pct=page_utilization_pct)
+        _bias_name = "HIGH (expand-favored, below 95% target)"
     else:
+        # 95 ≤ util < 100: at target with no overflow — content richness decides.
         bias = _BIAS_NEUTRAL
         _bias_name = "NEUTRAL"
     import logging as _logging

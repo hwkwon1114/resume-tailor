@@ -402,8 +402,14 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
             if still_bad:
                 resume = _mechanical_trim_orphans(resume, still_bad, model=model)
         # Bug #1: fix_bullets may drop bullets via drop_ids, leaving experience
-        # entries with <2 bullets. Re-enforce the structural rule.
-        resume = _drop_empty_sections(resume)
+        # entries with <2 bullets. Re-enforce the structural rule — but relax
+        # the floor to 1 when we entered the call already underutilized, so the
+        # harness doesn't compound a drop by nuking the whole role at a moment
+        # it should be preserving content. The strict 2-bullet rule still
+        # applies to generation-time output (line 153) and the overflow-recovery
+        # trim loop (where dropping more is fine).
+        min_floor = 1 if util < 95 else 2
+        resume = _drop_empty_sections(resume, min_exp_bullets=min_floor)
 
     # Step 3: mechanical drop fallback — only if the LLM pass was not enough.
     pf2 = PageFitValidator().run(resume)
@@ -663,17 +669,19 @@ def _boost_skills_from_jd(resume: Resume, input_resume: Resume, jd: str) -> Resu
     return Resume.model_validate(data)
 
 
-def _drop_empty_sections(resume: Resume) -> Resume:
-    """Remove low-bullet experience/project entries after generation.
+def _drop_empty_sections(resume: Resume, *, min_exp_bullets: int = 2) -> Resume:
+    """Remove low-bullet experience/project entries.
 
-    - Experience entries with < 2 bullets are dropped: a 2-line header for 1 bullet
-      wastes space and violates the prompt rule. The prompt instructs the LLM not to
-      do this, but mechanical enforcement ensures it.
+    - Experience entries with fewer than `min_exp_bullets` bullets are dropped.
+      Default is 2: a 2-line header for 1 bullet wastes space and violates the
+      generation prompt. Pass `min_exp_bullets=1` from post-processing call sites
+      that have already detected underutilization — at low util, preserving a
+      1-bullet role contributes more content than dropping a whole header+bullet.
     - Project entries with 0 bullets are dropped (1 bullet is acceptable for projects).
     - Education entries are kept even without bullets (degree + GPA lines always show).
     """
     data = resume.model_dump()
-    data["experience"] = [s for s in data["experience"] if len(s["bullets"]) >= 2]
+    data["experience"] = [s for s in data["experience"] if len(s["bullets"]) >= min_exp_bullets]
     data["projects"] = [s for s in data["projects"] if s["bullets"]]
     return Resume.model_validate(data)
 

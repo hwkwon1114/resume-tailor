@@ -300,3 +300,62 @@ def test_llm_clean_truncated_returns_none_when_llm_exceeds_budget():
         model=model,
     )
     assert result is None
+
+
+# ── fix_bullets bias selection by page utilization ────────────────────────────
+# The bias is communicated to the LLM via the system prompt's TWO_LINE_ORPHAN
+# section. We capture the system prompt and assert the right bias text appears.
+
+
+class _PromptCapturingModel:
+    """Records the system+prompt of the most recent generate_structured call."""
+
+    def __init__(self):
+        self.captured: dict = {}
+
+    def generate_structured(self, *, system, prompt, schema):
+        self.captured["system"] = system
+        self.captured["prompt"] = prompt
+        return ModelResponse(
+            data=schema.model_validate({"rewrites": [{"id": "b0", "text": "x" * 100}], "drop_ids": []}),
+            model_name="stub",
+        )
+
+
+@pytest.mark.parametrize(
+    "util_pct,expected_substr,disallowed_substr",
+    [
+        (82, "strongly prefer expanding", "prefer trimming"),   # below 95% target → HIGH
+        (88, "strongly prefer expanding", "prefer trimming"),   # the old NEUTRAL band — now HIGH
+        (94, "strongly prefer expanding", "prefer trimming"),   # just below target → HIGH
+        (95, "content richness", "strongly prefer expanding"),  # at target → NEUTRAL
+        (99, "content richness", "strongly prefer expanding"),  # just under 100 → NEUTRAL
+        (100, "prefer trimming", "strongly prefer expanding"),  # saturation/overflow → LOW
+        (110, "prefer trimming", "strongly prefer expanding"),  # heavy overflow → LOW
+    ],
+)
+def test_fix_bullets_bias_aligns_with_95pct_target(util_pct, expected_substr, disallowed_substr):
+    """Below 95 → expand-favored; 95-99 → neutral; ≥100 (overflow) → trim-favored.
+
+    Previously the band thresholds were 90/80, which left 80-89% in NEUTRAL
+    (allowing the LLM to trim and worsen underutilization) and treated >=100%
+    overflow as expand-favored (which grew the overflow further). This test
+    locks the new alignment with the orchestrator's 95% target.
+    """
+    resume = _make_resume([{"id": "b0", "text": "a" * 140, "source_ids": ["src"]}])
+    model = _PromptCapturingModel()
+    fix_bullets(
+        resume,
+        orphan_ids=["b0"],
+        overflow_candidate_ids=[],
+        model=model,
+        page_utilization_pct=util_pct,
+        orphan_categories={"b0": OrphanCategory.TWO_LINE_ORPHAN},
+    )
+    assert expected_substr in model.captured["system"], (
+        f"util={util_pct}%: expected '{expected_substr}' in system prompt, "
+        f"got: ...{model.captured['system'][-300:]}"
+    )
+    assert disallowed_substr not in model.captured["system"], (
+        f"util={util_pct}%: '{disallowed_substr}' must NOT be in the system prompt"
+    )

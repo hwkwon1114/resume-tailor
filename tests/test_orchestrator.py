@@ -406,13 +406,15 @@ class _NoopModel:
 
 
 # Bug #1: _drop_empty_sections must run after fix_bullets so 1-bullet
-# experience entries (created by LLM drops) are removed.
+# experience entries (created by LLM drops) are removed when the page is
+# already well-utilized. (At low util the rule flips — see the test below.)
 def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     """_fix_and_trim_orphans must call _drop_empty_sections after fix_bullets.
 
     Setup: a resume with one 2-bullet role; fix_bullets drops one bullet,
     leaving a 1-bullet role. Without the post-drop _drop_empty_sections call,
-    the 1-bullet role would survive.
+    the 1-bullet role would survive. The page_fit stub reports util=95, so
+    the strict 2-bullet floor applies (no underutilization-relaxation).
     """
     resume = Resume.model_validate({
         "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
@@ -455,6 +457,111 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     assert len(result.experience) == 0, (
         "Bug #1: _drop_empty_sections must run after fix_bullets to remove "
         f"experience entries with <2 bullets, got {len(result.experience)}"
+    )
+
+
+def test_fix_bullets_preserves_1bullet_role_when_underutilized():
+    """At util<95, a role reduced to 1 bullet by fix_bullets is PRESERVED.
+
+    The strict 2-bullet floor (test_fix_bullets_followed_by_drop_empty_sections)
+    is intentional at-or-above target — a 2-line header for 1 bullet wastes
+    space. Below the 95% target, that same rule destroys content the page
+    actually needs: dropping a 1-bullet role nukes a real experience entry to
+    enforce a visual-density preference, leaving the page even emptier. Under
+    underutilization, _fix_and_trim_orphans must relax the floor to 1 so the
+    surviving bullet keeps contributing content.
+    """
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0", "text": "a" * 130, "source_ids": ["src"]},  # orphan
+                {"id": "b1", "text": "Other bullet.", "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    # PageFitValidator stub: util=80 (well below 95% target), 1 page.
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 80},
+        )
+
+    # fix_bullets stub: drop b1 (same behavior as the strict-floor test).
+    def fake_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        data = resume_in.model_dump()
+        for sec in data["experience"]:
+            sec["bullets"] = [b for b in sec["bullets"] if b["id"] != "b1"]
+        return Resume.model_validate(data)
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=fake_fix_bullets):
+        result = _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    # The role had 2 bullets, fix_bullets dropped one, leaving 1.
+    # Because util=80 < 95, the 1-bullet role must be preserved, not nuked.
+    assert len(result.experience) == 1, (
+        "at util<95, _drop_empty_sections must relax to min_exp_bullets=1; "
+        f"the 1-bullet role should be preserved, got {len(result.experience)} roles"
+    )
+    assert len(result.experience[0].bullets) == 1, (
+        f"the surviving bullet (b0) should still be there, "
+        f"got {len(result.experience[0].bullets)} bullets"
+    )
+
+
+def test_fix_bullets_preserves_1bullet_role_at_util_94_boundary():
+    """Boundary lock: util=94 is still <95, so the relaxed floor still applies.
+
+    Pairs with the util=80 and util=95 cases to pin the strict `<` semantics of
+    the `util < 95` gate at line 411 of harness/orchestrator.py — guards against
+    an accidental flip to `<=` (which would only relax below 94).
+    """
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0", "text": "a" * 130, "source_ids": ["src"]},
+                {"id": "b1", "text": "Other bullet.", "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 94},
+        )
+
+    def fake_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        data = resume_in.model_dump()
+        for sec in data["experience"]:
+            sec["bullets"] = [b for b in sec["bullets"] if b["id"] != "b1"]
+        return Resume.model_validate(data)
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=fake_fix_bullets):
+        result = _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    assert len(result.experience) == 1, (
+        f"at util=94 (still <95), the 1-bullet role must be preserved; "
+        f"got {len(result.experience)} roles — did the orchestrator flip the "
+        f"comparison to <=95 by mistake?"
     )
 
 
