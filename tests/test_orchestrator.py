@@ -535,6 +535,93 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     )
 
 
+def test_run_returns_cached_result_without_calling_model(tmp_path, monkeypatch):
+    """Result cache: a hit must short-circuit run() and skip every LLM call.
+
+    Quota optimization — re-running the same (jd, input_resume) pair (common
+    during dev iteration) should cost zero Gemini calls.
+    """
+    from harness.orchestrator import OrchestratorResult, _cache_key
+
+    monkeypatch.setattr("harness.orchestrator._CACHE_DIR", tmp_path)
+    inp = _load()
+    jd = "cache-hit jd text"
+    cached_resume = _good_tailored(inp)
+
+    # Pre-seed the cache directly (avoids needing a full first run).
+    key = _cache_key(jd, inp)
+    (tmp_path / f"{key}.json").write_text(json.dumps({
+        "passed": True,
+        "final_resume": cached_resume.model_dump(),
+        "final_metrics": {"pages": 1, "page_utilization_pct": 96},
+    }))
+
+    class _RaisingModel:
+        def generate_structured(self, **kw):
+            raise AssertionError("cache hit must skip generate_structured")
+        def generate_text(self, **kw):
+            raise AssertionError("cache hit must skip generate_text")
+
+    result = run(jd=jd, input_resume=inp, model=_RaisingModel())
+
+    assert isinstance(result, OrchestratorResult)
+    assert result.passed is True
+    assert result.final_resume == cached_resume
+    assert result.final_metrics == {"pages": 1, "page_utilization_pct": 96}
+    # Trajectory is intentionally not preserved across cache hits — callers
+    # use the final resume + metrics; trajectory is debug-only signal that
+    # would balloon the cache file unnecessarily.
+    assert result.trajectory == []
+
+
+def test_cache_store_writes_only_passed_results(tmp_path, monkeypatch):
+    """A failed orchestrator result must NOT be cached — caching a failure
+    would prevent retry-driven recovery on the next run."""
+    from harness.orchestrator import OrchestratorResult, _cache_key, _cache_store
+
+    monkeypatch.setattr("harness.orchestrator._CACHE_DIR", tmp_path)
+    inp = _load()
+    out = _good_tailored(inp)
+    key = _cache_key("jd", inp)
+
+    _cache_store(key, OrchestratorResult(
+        passed=False, final_resume=out, trajectory=[], final_metrics={"x": 1},
+    ))
+    assert not (tmp_path / f"{key}.json").exists()
+
+    _cache_store(key, OrchestratorResult(
+        passed=True, final_resume=out, trajectory=[], final_metrics={"x": 2},
+    ))
+    assert (tmp_path / f"{key}.json").exists()
+    payload = json.loads((tmp_path / f"{key}.json").read_text())
+    assert payload["passed"] is True
+    assert payload["final_metrics"] == {"x": 2}
+
+
+def test_run_no_cache_kwarg_disables_cache_path(tmp_path, monkeypatch):
+    """use_cache=False must bypass both read and write — even if a hit exists,
+    the model is consulted. Escape hatch for callers that explicitly want a
+    fresh run (e.g. regression testing the orchestrator itself)."""
+    from harness.orchestrator import _cache_key
+
+    monkeypatch.setattr("harness.orchestrator._CACHE_DIR", tmp_path)
+    inp = _load()
+    jd = "no-cache jd"
+
+    # Seed a poisoned cache that would crash if read.
+    key = _cache_key(jd, inp)
+    (tmp_path / f"{key}.json").write_text("not valid json {{{")
+
+    class _RaisingModel:
+        def generate_structured(self, **kw):
+            raise RuntimeError("expected: model consulted because use_cache=False")
+        def generate_text(self, **kw):
+            raise RuntimeError("expected: model consulted because use_cache=False")
+
+    with pytest.raises(RuntimeError, match="expected: model consulted"):
+        run(jd=jd, input_resume=inp, model=_RaisingModel(), use_cache=False)
+
+
 def test_fix_and_trim_orphans_skips_llm_when_already_at_target():
     """Pre-flight skip: when pages=1 and util>=95, the heavy fix_bullets LLM
     rewrite must NOT fire — even if cosmetic orphans are detected.

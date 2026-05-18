@@ -13,9 +13,13 @@ Feedback replaces across attempts (no unbounded prompt growth).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from harness.generate import FeedbackMessage, generate
@@ -123,6 +127,49 @@ class OrchestratorResult:
     final_metrics: dict[str, Any]
 
 
+_CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "resume-tailor"
+
+
+def _cache_key(jd: str, input_resume: Resume) -> str:
+    """SHA-256 of jd + canonical resume JSON; stable across runs."""
+    payload = jd + json.dumps(input_resume.model_dump(), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cache_load(key: str) -> OrchestratorResult | None:
+    path = _CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("[cache] read failed for %s: %r — treating as miss", key[:12], exc)
+        return None
+    return OrchestratorResult(
+        passed=data["passed"],
+        final_resume=Resume.model_validate(data["final_resume"]),
+        trajectory=[],
+        final_metrics=data["final_metrics"],
+    )
+
+
+def _cache_store(key: str, result: OrchestratorResult) -> None:
+    # Caching a failure would prevent retry-driven recovery on the next run.
+    if not result.passed:
+        return
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "passed": result.passed,
+        "final_resume": result.final_resume.model_dump(),
+        "final_metrics": result.final_metrics,
+    }
+    (_CACHE_DIR / f"{key}.json").write_text(json.dumps(payload))
+
+
+def _cache_enabled(use_cache: bool) -> bool:
+    return use_cache and not os.environ.get("RESUME_TAILOR_NO_CACHE")
+
+
 def run(
     *,
     jd: str,
@@ -131,8 +178,17 @@ def run(
     judge_model: ModelClient | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     progress: Callable[[str, dict], None] | None = None,
+    use_cache: bool = True,
 ) -> OrchestratorResult:
     """Run the harness loop."""
+    cache_active = _cache_enabled(use_cache)
+    cache_key = _cache_key(jd, input_resume) if cache_active else None
+    if cache_key is not None:
+        cached = _cache_load(cache_key)
+        if cached is not None:
+            log.info("[cache HIT] %s — skipping all LLM calls", cache_key[:12])
+            return cached
+
     judge_client = judge_model or model
     trajectory: list[RetryRecord] = []
     feedback = FeedbackMessage()
@@ -251,12 +307,15 @@ def run(
             # passed is honest about post-processing: if the orphan-fixer/trim
             # pipeline couldn't restore page_fit (rare, but possible when the
             # loop exited optimistically on the last attempt), passed=False.
-            return OrchestratorResult(
+            result = OrchestratorResult(
                 passed=pf_passed_after_postproc,
                 final_resume=candidate,
                 trajectory=trajectory,
                 final_metrics=metrics,
             )
+            if cache_key is not None:
+                _cache_store(cache_key, result)
+            return result
 
     candidate_records = [r for r in trajectory if r.candidate is not None]
     if not candidate_records:
