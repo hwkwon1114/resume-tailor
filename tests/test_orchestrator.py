@@ -487,8 +487,9 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
 
     Setup: a resume with one 2-bullet role; fix_bullets drops one bullet,
     leaving a 1-bullet role. Without the post-drop _drop_empty_sections call,
-    the 1-bullet role would survive. The page_fit stub reports util=95, so
-    the strict 2-bullet floor applies (no underutilization-relaxation).
+    the 1-bullet role would survive. Incoming state is pages=2 (overflow,
+    so the at-target pre-flight skip is bypassed) but util=96 (≥95, so the
+    strict 2-bullet floor applies — no underutilization-relaxation).
     """
     resume = Resume.model_validate({
         "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
@@ -506,13 +507,13 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
         "education": [], "projects": [], "skills": ["Python"],
     })
 
-    # PageFitValidator stub: always passes, util 95% pre-fix and 95% post-fix
-    # (so the rescue path is not triggered).
+    # PageFitValidator stub: pages=2 (so pre-flight at-target skip is bypassed),
+    # util=96 (≥95, so the strict 2-bullet floor applies in _drop_empty_sections).
     def fake_pf_run(self, output):
         return ValidationResult(
-            name="page_fit", passed=True, score=1.0, errors=[],
-            payload={"pages": 1, "overflow_bullet_ids": [],
-                     "font_substituted": False, "page_utilization_pct": 95},
+            name="page_fit", passed=False, score=0.0, errors=["overflow"],
+            payload={"pages": 2, "overflow_bullet_ids": ["b0"],
+                     "font_substituted": False, "page_utilization_pct": 96},
         )
 
     # fix_bullets stub: drop b1 (LLM "decides" to drop the non-orphan).
@@ -532,6 +533,54 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
         "Bug #1: _drop_empty_sections must run after fix_bullets to remove "
         f"experience entries with <2 bullets, got {len(result.experience)}"
     )
+
+
+def test_fix_and_trim_orphans_skips_llm_when_already_at_target():
+    """Pre-flight skip: when pages=1 and util>=95, the heavy fix_bullets LLM
+    rewrite must NOT fire — even if cosmetic orphans are detected.
+
+    Empirical motivation: in a real bench run the LLM rewrite on an
+    already-passing page (pages=1 util=100% with 12 orphans) dropped util
+    100% → 91% → 88%. The whole-resume rewrite optimizes for orphan-free
+    layout, which trades fill for tidiness — wrong tradeoff at target.
+    Lighter mechanical-only cleanup is preferred at target.
+    """
+    from harness.judges.orphan_fixer import OrphanCategory
+
+    resume = Resume.model_validate({
+        "contact": {"name": "T", "email": "t@t.com", "phone": "555-0000",
+                    "location": "Chicago, IL", "links": []},
+        "summary": "S.",
+        "experience": [{
+            "id": "exp-0", "title": "Engineer", "employer": "Acme",
+            "start_date": "Jan 2020", "end_date": "Jan 2023",
+            "location": "Chicago, IL",
+            "bullets": [
+                {"id": "b0", "text": "a" * 200, "source_ids": ["src"]},
+                {"id": "b1", "text": "b" * 200, "source_ids": ["src"]},
+            ],
+        }],
+        "education": [], "projects": [], "skills": ["Python"],
+    })
+
+    # pages=1, util=97 — comfortably at target.
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 97},
+        )
+
+    # Geometry reports orphans — the trigger that would normally fire fix_bullets.
+    fake_orphan_cats = {"b0": OrphanCategory.TWO_LINE_ORPHAN}
+    fix_mock = MagicMock(side_effect=lambda r, *a, **kw: r)
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.detect_orphans_geometry", return_value=fake_orphan_cats), \
+         patch("harness.orchestrator.fix_bullets", fix_mock):
+        _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    fix_mock.assert_not_called()
 
 
 def test_fix_bullets_preserves_1bullet_role_when_underutilized():

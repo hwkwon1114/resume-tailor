@@ -381,6 +381,22 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
     else:
         # Geometry unavailable (render failed / no weasyprint) — fall back to char-based.
         orphans = detect_orphans(resume)
+
+    # Pre-flight skip: at target (pages=1, util>=95) the heavy fix_bullets LLM
+    # rewrite is a net negative — empirically observed to drop util 100% → 88%
+    # by over-trimming for orphan-free layout. Run only the cheap mechanical
+    # shrink for any 3-line orphans (cosmetic cleanup) and return.
+    if pf.passed and util >= 95:
+        log.info(
+            "[post-proc/0:at-target-skip] pages=1 util=%d%% orphans=%d — skipping fix_bullets LLM",
+            util, len(orphans),
+        )
+        if orphan_cats:
+            for bid, cat in orphan_cats.items():
+                if cat in (OrphanCategory.THREE_LINE_ORPHAN, OrphanCategory.THREE_LINE_FULL):
+                    resume = _iterative_shrink_to_fit(resume, bid, max_lines=2, model=model)
+        return resume
+
     if orphans or overflow_candidate_ids:
         log.info(
             "[post-proc/1:before_llm_fix] orphans=%d overflow_cands=%d util_at_call=%d%%",
