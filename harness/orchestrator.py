@@ -537,7 +537,7 @@ def _fix_and_trim_orphans(resume: Resume, model: ModelClient, input_resume: Resu
         )
         rescued = fix_bullets(
             resume, [], [], model,
-            page_utilization_pct=100,
+            page_utilization_pct=final_util,
             force_expand_ids=expand_ids,
         )
         rescued_pf = PageFitValidator().run(rescued)

@@ -886,6 +886,51 @@ def test_iterative_rescue_makes_multiple_passes_when_util_climbing():
         assert expand_ids, f"rescue iter={i}: force_expand_ids should be non-empty"
 
 
+def test_rescue_passes_real_util_not_hardcoded_100():
+    """The rescue must pass the CURRENT util into fix_bullets, not the target.
+
+    Bug observed in the AWS-content-developer 2026-05-15 bench (log line
+    "[fix_bullets] bias=LOW (trim-favored, page at/over limit) util=100% ...
+    [rescue iter=0] no progress — util 94% → 94%"):
+    the rescue passed page_utilization_pct=100 (the target), so the orphan
+    fixer's bias logic flipped to LOW (trim-favored), causing the LLM to
+    trim the very candidates the rescue was forcing it to expand. With the
+    real util (e.g. 94%) passed through, bias becomes HIGH (expand-favored),
+    aligning fixer behavior with rescue intent.
+    """
+    resume = _resume_with_skills(["Python"], bullets_per_role=3)
+
+    util_sequence = iter([80, 80, 80, 85, 92, 96])
+
+    def fake_pf_run(self, output):
+        try:
+            util = next(util_sequence)
+        except StopIteration:
+            util = 96
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": util},
+        )
+
+    util_args: list[int] = []
+
+    def spy_fix_bullets(resume_in, orphans, overflow, model, **kw):
+        util_args.append(kw.get("page_utilization_pct"))
+        return resume_in
+
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.orchestrator.fix_bullets", side_effect=spy_fix_bullets):
+        _fix_and_trim_orphans(resume, _NoopModel(), resume, "jd")
+
+    # 3 rescue iterations, each receiving the CURRENT util (80, 85, 92) —
+    # never the hardcoded 100 that flips bias to trim-favored.
+    assert util_args == [80, 85, 92], (
+        f"rescue must pass current util to fix_bullets so bias stays HIGH "
+        f"(expand-favored); got {util_args}"
+    )
+
+
 def test_iterative_rescue_stops_on_no_progress():
     """The rescue stops iterating when an iteration produces zero util gain.
 
