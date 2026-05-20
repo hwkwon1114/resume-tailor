@@ -535,6 +535,61 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     )
 
 
+def test_judge_error_does_not_count_as_pass(monkeypatch):
+    """A judge that errors must NOT short-circuit to fab_passed=True / jd_passed=True.
+
+    Current bug (pre-fix): `fab_result is None or not fab_result.flagged_bullets`
+    treats a timed-out judge as a clean audit, conflating "verified clean" with
+    "did not verify". The fix: a None result fails the attempt's exit gate,
+    forcing a retry (the judge gets another chance) or — if every attempt
+    errors the judge — the orchestrator falls through to best-of-N with
+    passed=False, an honest verdict.
+    """
+    inp = _load()
+    out = _good_tailored(inp)
+
+    # Make generate always succeed, fab always raise, jd always succeed.
+    # The retry loop should keep retrying (because fab errored → fab_passed=False)
+    # and ultimately hit the fallthrough with passed=False.
+    from harness.judges.orphan_fixer import _FixResult
+
+    class _FabRaisingModel:
+        def generate_structured(self, *, system, prompt, schema):
+            if schema is _AuditReport:
+                raise RuntimeError("simulated fab judge timeout")
+            if schema is _FixResult:
+                return ModelResponse(
+                    data=_FixResult(rewrites=[], drop_ids=[]), model_name="m",
+                )
+            return ModelResponse(
+                data=TailoringResponse(reasoning="r", resume=out), model_name="m",
+            )
+        def generate_text(self, **kw):
+            return ModelResponse(data="", model_name="m")
+
+    # Patch JDCoverageJudge.run to always pass cleanly — isolates the fab path.
+    def fake_jd_run(self, *, output_resume, jd, model):
+        return MagicMock(passed=True, score=1.0, uncovered_requirements=[])
+
+    # Force page_fit to passed=True at util=97, so the ONLY remaining
+    # reason passed could be False is the fab-errored treatment under test.
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 97},
+        )
+
+    with patch("harness.orchestrator.JDCoverageJudge.run", fake_jd_run), \
+         patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        result = run(jd="j", input_resume=inp, model=_FabRaisingModel(), max_retries=1, use_cache=False)
+
+    assert result.passed is False, (
+        "fab audit erroring on every attempt must yield passed=False — "
+        "treating an errored judge as a clean pass is dishonest"
+    )
+
+
 def test_run_returns_cached_result_without_calling_model(tmp_path, monkeypatch):
     """Result cache: a hit must short-circuit run() and skip every LLM call.
 

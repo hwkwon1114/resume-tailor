@@ -280,11 +280,13 @@ def run(
             candidate=candidate,
         ))
 
-        jd_passed = jd_cov_result is None or jd_cov_result.passed
-        # Strict fabrication policy: any flagged bullet (score < THRESHOLD) fails the attempt.
-        # If the audit itself failed (fab_result is None) we don't block — the orchestrator
-        # already treats other judge failures as informational rather than hard failures.
-        fab_passed = fab_result is None or not fab_result.flagged_bullets
+        # A judge that ERRORED out (result is None — timeout, parse fail, etc.)
+        # is NOT a pass. "Did not verify" must not be conflated with "verified
+        # clean". Force a retry so the judge gets another chance; if every
+        # attempt errors, the orchestrator falls through to best-of-N with
+        # passed=False, an honest verdict.
+        jd_passed = jd_cov_result is not None and jd_cov_result.passed
+        fab_passed = fab_result is not None and not fab_result.flagged_bullets
         _will_exit = (
             mechanical_passed and jd_passed and fab_passed
             and not page_underutilized and not page_overflowed
