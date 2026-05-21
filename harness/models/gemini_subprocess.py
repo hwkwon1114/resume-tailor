@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
-from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from harness.models._text_utils import compact_schema_dict, strip_fences
 from harness.models.base import ModelOutputError, ModelResponse
 
 GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
@@ -64,32 +63,6 @@ def _run(prompt: str) -> str:
     return result.stdout.strip()
 
 
-def _strip_fences(text: str) -> str:
-    """Remove markdown code fences if the model wrapped output in them."""
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\n?```\s*$", "", text, flags=re.MULTILINE)
-    # Strip ANSI escape codes
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    return text.strip()
-
-
-def _compact_schema_dict(obj: Any) -> Any:
-    """Recursively strip auto-generated `title` keys from a Pydantic JSON schema.
-
-    Pydantic emits a `title` on every property and class definition, defaulting
-    to the field name in TitleCase ("Source Ids", "End Date" etc.). These are
-    informational for human readers but content-free for an LLM — the property
-    key already conveys the same signal. Stripping them is ~18% off the
-    TailoringResponse schema, with no semantic loss (descriptions, types,
-    required, $defs, defaults all preserved).
-    """
-    if isinstance(obj, dict):
-        return {k: _compact_schema_dict(v) for k, v in obj.items() if k != "title"}
-    if isinstance(obj, list):
-        return [_compact_schema_dict(v) for v in obj]
-    return obj
-
-
 class GeminiSubprocessClient:
     """ModelClient that delegates to the local `gemini` CLI binary."""
 
@@ -100,7 +73,7 @@ class GeminiSubprocessClient:
         prompt: str,
         schema: type[BaseModel],
     ) -> ModelResponse[BaseModel]:
-        schema_blob = json.dumps(_compact_schema_dict(schema.model_json_schema()), indent=2)
+        schema_blob = json.dumps(compact_schema_dict(schema.model_json_schema()), indent=2)
         full_prompt = (
             f"{system}\n\n"
             f"{prompt}\n\n"
@@ -111,7 +84,7 @@ class GeminiSubprocessClient:
         raw_text = _run(full_prompt)
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        clean = _strip_fences(raw_text)
+        clean = strip_fences(raw_text)
         try:
             raw = json.loads(clean)
         except json.JSONDecodeError as exc:
@@ -140,7 +113,7 @@ class GeminiSubprocessClient:
         text = _run(full_prompt)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return ModelResponse(
-            data=_strip_fences(text),
+            data=strip_fences(text),
             model_name="gemini-cli/subprocess",
             latency_ms=latency_ms,
         )

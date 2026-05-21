@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-10 | Updated: 2026-05-10 -->
+<!-- Generated: 2026-05-10 | Updated: 2026-05-16 -->
 
 # prompts
 
@@ -9,8 +9,8 @@ Prompt templates kept as plain `.txt` files so prompt iteration shows up as read
 ## Key Files
 | File | Description |
 |------|-------------|
-| `system_generate.txt` | The main generator system prompt — rules for tailoring, source-attribution requirements, JSON output shape, length budgets. The largest and most-iterated prompt in the project. |
-| `system_judge.txt` | System prompt for the JD coverage judge — instructs the LLM to score 0–1 and list uncovered requirements. |
+| `system_generate.txt` | The main generator system prompt — rules for tailoring, source-attribution requirements, JSON output shape, length budgets. |
+| `system_fabrication_judge.txt` | System prompt for the fabrication audit (per-bullet support scoring, generalization-vs-specification rules, common fabrication patterns). |
 | `feedback_template.txt` | Retry feedback template — filled by the orchestrator with validator errors and uncovered JD requirements, then injected into the next generation attempt. |
 | `__init__.py` | `load_prompt(name)` — reads `{name}.txt` from this directory. |
 
@@ -33,7 +33,8 @@ Prompt templates kept as plain `.txt` files so prompt iteration shows up as read
 
 ### Internal
 - `harness/generate.py` reads `system_generate.txt` and `feedback_template.txt`.
-- `harness/judges/jd_coverage_judge.py` reads `system_judge.txt`.
+- `harness/judges/fabrication_audit.py` reads `system_fabrication_judge.txt`.
+- `harness/judges/jd_coverage_judge.py` uses an inline `_SYSTEM` constant (no file).
 
 ### External
 - None.

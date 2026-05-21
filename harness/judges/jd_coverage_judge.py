@@ -62,12 +62,12 @@ def _resume_text(resume: Resume) -> str:
 class JDCoverageJudge:
     def run(self, *, output_resume: Resume, jd: str, model: ModelClient) -> JDCoverageResult:
         prompt = _PROMPT.format(jd=jd.strip(), resume_text=_resume_text(output_resume))
-        try:
-            resp = model.generate_structured(system=_SYSTEM, prompt=prompt, schema=_CoverageReport)
-            report: _CoverageReport = resp.data
-        except Exception:
-            # If the LLM call fails, fall back to a neutral score so we don't block
-            return JDCoverageResult(score=0.5, passed=True, uncovered_requirements=[])
+        # Let exceptions propagate — the orchestrator's gate distinguishes
+        # "judge errored" from "judge said pass" via the `is not None` check
+        # in `jd_passed = jd_cov_result is not None and jd_cov_result.passed`.
+        # A silent-pass-on-exception conflated those two states.
+        resp = model.generate_structured(system=_SYSTEM, prompt=prompt, schema=_CoverageReport)
+        report: _CoverageReport = resp.data
         return JDCoverageResult(
             score=round(report.score, 3),
             passed=report.score >= THRESHOLD,

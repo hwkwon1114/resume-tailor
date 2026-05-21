@@ -17,14 +17,13 @@ import json
 import logging
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
-from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from harness.models._text_utils import compact_schema_dict, strip_fences
 from harness.models.base import ModelOutputError, ModelResponse
 
 log = logging.getLogger(__name__)
@@ -32,25 +31,6 @@ log = logging.getLogger(__name__)
 GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
 DEFAULT_PROMPT_TIMEOUT = 300  # ACP isn't subject to subprocess timeout walls
 PROTOCOL_VERSION = 1
-
-
-def _strip_fences(text: str) -> str:
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\n?```\s*$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    return text.strip()
-
-
-def _compact_schema_dict(obj: Any) -> Any:
-    """Recursively strip Pydantic's auto-generated `title` keys from schema.
-
-    Same compaction as the subprocess client — ~18% smaller schema blob.
-    """
-    if isinstance(obj, dict):
-        return {k: _compact_schema_dict(v) for k, v in obj.items() if k != "title"}
-    if isinstance(obj, list):
-        return [_compact_schema_dict(v) for v in obj]
-    return obj
 
 
 class GeminiAcpClient:
@@ -171,7 +151,7 @@ class GeminiAcpClient:
         prompt: str,
         schema: type[BaseModel],
     ) -> ModelResponse[BaseModel]:
-        schema_blob = json.dumps(_compact_schema_dict(schema.model_json_schema()), indent=2)
+        schema_blob = json.dumps(compact_schema_dict(schema.model_json_schema()), indent=2)
         full = (
             f"{system}\n\n{prompt}\n\n"
             "Output a single JSON object conforming to this schema "
@@ -181,7 +161,7 @@ class GeminiAcpClient:
         t0 = time.perf_counter()
         raw = self._prompt(full)
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        clean = _strip_fences(raw)
+        clean = strip_fences(raw)
         try:
             parsed = json.loads(clean)
         except json.JSONDecodeError as exc:
@@ -203,7 +183,7 @@ class GeminiAcpClient:
         t0 = time.perf_counter()
         text = self._prompt(f"{system}\n\n{prompt}")
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        return ModelResponse(data=_strip_fences(text), model_name="gemini-cli/acp", latency_ms=latency_ms)
+        return ModelResponse(data=strip_fences(text), model_name="gemini-cli/acp", latency_ms=latency_ms)
 
     def _shutdown(self) -> None:
         if self._proc is None:

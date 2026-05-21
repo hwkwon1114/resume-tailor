@@ -1,7 +1,7 @@
-"""Unit tests for the Gemini CLI subprocess client's helpers."""
+"""Unit tests for schema-compaction shared by both Gemini transport clients."""
 from __future__ import annotations
 
-from harness.models.gemini_subprocess import _compact_schema_dict
+from harness.models._text_utils import compact_schema_dict as _compact_schema_dict
 
 
 def test_compact_schema_strips_title_keys():

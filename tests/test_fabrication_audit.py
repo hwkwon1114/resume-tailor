@@ -61,7 +61,6 @@ def test_batches_audit_by_chunk_size_and_merges_results():
 
     class _ChunkRecordingModel:
         def generate_structured(self, *, system, prompt, schema):
-            import json
             import re
             # The prompt embeds the JSON items as `"bullet_id": "exp-0-out-N"`.
             ids = re.findall(r'"bullet_id":\s*"([^"]+)"', prompt)
