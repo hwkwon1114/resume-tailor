@@ -16,7 +16,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-from harness.orchestrator import OrchestratorResult, run
+from harness.orchestrator import OrchestratorResult, run, would_pass_under_fast
 from harness.pdf_intake import extract_text_from_pdf
 from harness.schema import Resume, autopopulate_bullet_ids
 from render.pdf import render_to_pdf
@@ -71,6 +71,18 @@ def _render_metrics(result: OrchestratorResult) -> None:
         st.metric("Source attribution", f"{sa:.2f}" if sa is not None else "—", delta_color=_metric_color(sa, 1.0, 0.8))
 
     st.metric("Voice drift (max)", f"{m.get('voice_drift_max', 0):.2f}", delta="lower is better", delta_color="off")
+
+    fab_status = m.get("fab_verification", "—")
+    flagged = m.get("fabrication_flagged_count")
+    label_map = {
+        "complete": ("Fabrication audit", "✓ no flags", "normal"),
+        "flagged": ("Fabrication audit", f"✗ {flagged} flagged", "inverse"),
+        "errored": ("Fabrication audit", "judge errored", "inverse"),
+        "skipped": ("Fabrication audit", "skipped (--fast)", "off"),
+    }
+    if fab_status in label_map:
+        label, delta, color = label_map[fab_status]
+        st.metric(label, fab_status, delta=delta, delta_color=color)
 
 
 def main() -> None:
@@ -129,6 +141,16 @@ def main() -> None:
                         st.error(f"Parse failed: {exc}")
 
         ready = bool(jd.strip()) and resume_obj is not None
+        fast_mode = st.checkbox(
+            "Fast mode (skip fabrication audit)",
+            value=False,
+            help=(
+                "Skip the LLM-based fabrication audit. Saves one Gemini call per attempt. "
+                "Mechanical source-attribution + page-fit + JD coverage still gate. "
+                "Use when you know the JD is a stretch and want a publishable draft quickly. "
+                "Metrics will show fab_verification: skipped."
+            ),
+        )
         run_clicked = st.button("Tailor", type="primary", disabled=not ready)
 
     with right:
@@ -145,16 +167,44 @@ def main() -> None:
             progress_log.append(f"{stage}: {payload}")
             progress_slot.info(f"{stage} (attempt {payload.get('attempt', '?')})")
 
-        result = run(jd=jd, input_resume=resume_obj, model=_gemini(), judge_model=_gemini(), progress=progress)
+        result = run(
+            jd=jd, input_resume=resume_obj, model=_gemini(), judge_model=_gemini(),
+            progress=progress, fast=fast_mode,
+        )
         st.session_state["last_result"] = result
+        st.session_state["last_fast_mode"] = fast_mode
+        st.session_state["fast_accepted"] = False
 
     if "last_result" in st.session_state:
         result: OrchestratorResult = st.session_state["last_result"]
+        ran_fast = st.session_state.get("last_fast_mode", False)
+        fast_accepted = st.session_state.get("fast_accepted", False)
+        # C: default-mode failed BUT some attempt would pass under --fast.
+        # Offer one-click post-hoc acceptance so the user doesn't re-run.
+        offer_fast_accept = (
+            not result.passed and not ran_fast and not fast_accepted
+            and any(would_pass_under_fast(r) for r in result.trajectory)
+        )
         with metrics_slot:
             _render_metrics(result)
         with result_slot:
             if result.passed:
                 st.success(f"Tailored resume ready (page count: {result.final_metrics.get('page_fit_pages')})")
+            elif fast_accepted:
+                st.success(
+                    "Accepted under --fast semantics — fabrication audit was skipped. "
+                    "Mechanical source-attribution + page-fit + JD coverage all passed."
+                )
+            elif offer_fast_accept:
+                st.warning(
+                    "Strict mode failed only on the fabrication audit. The page, schema, "
+                    "source attribution, field lock, and JD coverage all pass on at least "
+                    "one attempt. You can accept the result with fabrication verification "
+                    "explicitly skipped (the same as running --fast)."
+                )
+                if st.button("Accept under --fast semantics", type="primary"):
+                    st.session_state["fast_accepted"] = True
+                    st.rerun()
             else:
                 st.warning("Result did not fully pass the harness; see debug for details. PDF is still downloadable.")
             try:

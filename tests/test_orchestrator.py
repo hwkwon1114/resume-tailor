@@ -535,6 +535,62 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     )
 
 
+def test_would_pass_under_fast_recognizes_clean_except_fab():
+    """A RetryRecord that passes mech + jd + page but has fab flags is the
+    exact case --fast addresses; the helper must say True so the web app
+    can offer post-hoc acceptance."""
+    from harness.orchestrator import (
+        FeedbackMessage,
+        RetryRecord,
+        would_pass_under_fast,
+    )
+
+    def _pf(pages=1, util=97, passed=True):
+        return ValidationResult(
+            name="page_fit", passed=passed, score=1.0, errors=[],
+            payload={"pages": pages, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": util},
+        )
+    def _ok(name):
+        return ValidationResult(name=name, passed=True, score=1.0, errors=[], payload={})
+
+    clean_except_fab = RetryRecord(
+        attempt=0,
+        validator_results=[
+            _ok("schema_check"), _ok("source_attribution"), _ok("field_lock"),
+            _pf(pages=1, util=97),
+        ],
+        jd_coverage_result=MagicMock(passed=True, score=0.65),
+        voice_result=None,
+        feedback=FeedbackMessage(),
+        fabrication_result=MagicMock(flagged_bullets=[MagicMock()]),  # has flags
+    )
+    assert would_pass_under_fast(clean_except_fab) is True
+
+    # Counter-cases that must NOT be flagged as would-pass-fast:
+    page_underutilized = RetryRecord(
+        attempt=0,
+        validator_results=[
+            _ok("schema_check"), _ok("source_attribution"), _ok("field_lock"),
+            _pf(pages=1, util=88),  # below 95
+        ],
+        jd_coverage_result=MagicMock(passed=True, score=0.65),
+        voice_result=None, feedback=FeedbackMessage(),
+    )
+    assert would_pass_under_fast(page_underutilized) is False
+
+    jd_failed = RetryRecord(
+        attempt=0,
+        validator_results=[
+            _ok("schema_check"), _ok("source_attribution"), _ok("field_lock"),
+            _pf(pages=1, util=97),
+        ],
+        jd_coverage_result=MagicMock(passed=False, score=0.4),  # below floor
+        voice_result=None, feedback=FeedbackMessage(),
+    )
+    assert would_pass_under_fast(jd_failed) is False
+
+
 def test_fast_mode_skips_fab_audit_entirely(monkeypatch):
     """`fast=True` must not call FabricationAudit at all — saves the parallel
     batch call per attempt and lets the orchestrator exit on mech+jd+page

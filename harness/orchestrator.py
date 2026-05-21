@@ -90,6 +90,23 @@ class RetryRecord:
     candidate: Resume | None = None
 
 
+def would_pass_under_fast(record: RetryRecord) -> bool:
+    """True iff this attempt would have cleanly exited under fast=True.
+
+    All non-fab gates must pass: mechanical validators, jd coverage, page=1,
+    util>=95. Used by the web app to detect "default-mode failed but the same
+    resume would pass under --fast" so the user can accept the fast verdict
+    post-hoc without re-running.
+    """
+    mech_pass = all(v.passed for v in record.validator_results if v.name != "page_fit")
+    pf = next((v for v in record.validator_results if v.name == "page_fit"), None)
+    pages = pf.payload.get("pages", 1) if pf else 1
+    util = pf.payload.get("page_utilization_pct", 0) if pf else 0
+    page_ok = pages == 1 and util >= 95
+    jd_pass = record.jd_coverage_result is not None and record.jd_coverage_result.passed
+    return mech_pass and jd_pass and page_ok
+
+
 def _attempt_score(record: RetryRecord) -> tuple[int, int, int, int, int]:
     """Lexicographic attempt quality score; lower tuple = better.
 
