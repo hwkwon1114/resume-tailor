@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -77,8 +78,15 @@ def main() -> None:
 
     out_path = args.out or _ROOT / f"{resume.contact.name.replace(' ', '_')}_tailored.pdf"
 
-    from harness.models.gemini_subprocess import GeminiSubprocessClient
-    model = GeminiSubprocessClient()
+    # Default to ACP (persistent JSON-RPC channel — ~10s startup amortized
+    # across all calls, no subprocess 120s timeout wall). Override with
+    # GEMINI_TRANSPORT=subprocess for the legacy subprocess-per-call client.
+    if os.environ.get("GEMINI_TRANSPORT", "acp") == "subprocess":
+        from harness.models.gemini_subprocess import GeminiSubprocessClient
+        model = GeminiSubprocessClient()
+    else:
+        from harness.models.gemini_acp import GeminiAcpClient
+        model = GeminiAcpClient()
 
     attempt_log: list[str] = []
 

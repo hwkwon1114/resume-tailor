@@ -30,9 +30,13 @@ def _load_resume(text: str) -> Resume:
     return Resume.model_validate(autopopulate_bullet_ids(raw))
 
 
-def _gemini() -> "GeminiSubprocessClient":
-    from harness.models.gemini_subprocess import GeminiSubprocessClient
-    return GeminiSubprocessClient()
+def _gemini():
+    import os
+    if os.environ.get("GEMINI_TRANSPORT", "acp") == "subprocess":
+        from harness.models.gemini_subprocess import GeminiSubprocessClient
+        return GeminiSubprocessClient()
+    from harness.models.gemini_acp import GeminiAcpClient
+    return GeminiAcpClient()
 
 
 def _intake_parse(text: str) -> "Resume":
