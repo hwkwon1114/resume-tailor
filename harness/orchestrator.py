@@ -179,9 +179,22 @@ def run(
     max_retries: int = DEFAULT_MAX_RETRIES,
     progress: Callable[[str, dict], None] | None = None,
     use_cache: bool = True,
+    fast: bool = False,
 ) -> OrchestratorResult:
-    """Run the harness loop."""
-    cache_active = _cache_enabled(use_cache)
+    """Run the harness loop.
+
+    fast=True: skip the FabricationAudit call entirely; the exit gate accepts
+    attempts that pass mech + jd + page_fit alone. Trades the LLM's deep
+    semantic fabrication check for ~one full Gemini call per attempt of
+    wall-clock savings. The mechanical source_attribution validator and the
+    generator prompt's anti-fabrication rules still apply. Final metrics
+    annotate the bypass via `fab_verification: "skipped"`.
+
+    Cache interaction: fast-mode results are never cached, so a fast-mode run
+    cannot poison a future strict-mode lookup.
+    """
+    # Fast-mode results bypass the cache to keep the cache verified-only.
+    cache_active = _cache_enabled(use_cache) and not fast
     cache_key = _cache_key(jd, input_resume) if cache_active else None
     if cache_key is not None:
         cached = _cache_load(cache_key)
@@ -247,25 +260,34 @@ def run(
         # Strict policy: ANY bullet below FABRICATION_THRESHOLD triggers a retry.
         if progress:
             progress("jd_coverage_judge", {"attempt": attempt})
-            progress("fabrication_audit", {"attempt": attempt})
+            if not fast:
+                progress("fabrication_audit", {"attempt": attempt})
         jd_cov_result: JDCoverageResult | None = None
         fab_result: FabricationAuditResult | None = None
-        with ThreadPoolExecutor(max_workers=2) as judge_pool:
-            jd_future = judge_pool.submit(
-                JDCoverageJudge().run, output_resume=candidate, jd=jd, model=judge_client
-            )
-            fab_future = judge_pool.submit(
-                FabricationAudit().run,
-                input_resume=input_resume, output_resume=candidate, model=judge_client,
-            )
+        if fast:
             try:
-                jd_cov_result = jd_future.result()
+                jd_cov_result = JDCoverageJudge().run(
+                    output_resume=candidate, jd=jd, model=judge_client,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("jd_coverage judge failed on attempt %d: %r", attempt, exc)
-            try:
-                fab_result = fab_future.result()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
+        else:
+            with ThreadPoolExecutor(max_workers=2) as judge_pool:
+                jd_future = judge_pool.submit(
+                    JDCoverageJudge().run, output_resume=candidate, jd=jd, model=judge_client
+                )
+                fab_future = judge_pool.submit(
+                    FabricationAudit().run,
+                    input_resume=input_resume, output_resume=candidate, model=judge_client,
+                )
+                try:
+                    jd_cov_result = jd_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("jd_coverage judge failed on attempt %d: %r", attempt, exc)
+                try:
+                    fab_result = fab_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("fabrication_audit failed on attempt %d: %r", attempt, exc)
 
         voice_result = VoiceCheck().run(input_resume=input_resume, output_resume=candidate)
 
@@ -284,9 +306,10 @@ def run(
         # is NOT a pass. "Did not verify" must not be conflated with "verified
         # clean". Force a retry so the judge gets another chance; if every
         # attempt errors, the orchestrator falls through to best-of-N with
-        # passed=False, an honest verdict.
+        # passed=False, an honest verdict. Exception: fast=True deliberately
+        # skips fab — the user opted into the bypass and the metric annotates it.
         jd_passed = jd_cov_result is not None and jd_cov_result.passed
-        fab_passed = fab_result is not None and not fab_result.flagged_bullets
+        fab_passed = fast or (fab_result is not None and not fab_result.flagged_bullets)
         _will_exit = (
             mechanical_passed and jd_passed and fab_passed
             and not page_underutilized and not page_overflowed
@@ -304,7 +327,7 @@ def run(
         if _will_exit:
             candidate = _fix_and_trim_orphans(candidate, judge_client, input_resume, jd)
             metrics, pf_passed_after_postproc = _finalize_metrics(
-                candidate, validator_results, jd_cov_result, voice_result, fab_result
+                candidate, validator_results, jd_cov_result, voice_result, fab_result, fast=fast,
             )
             # passed is honest about post-processing: if the orphan-fixer/trim
             # pipeline couldn't restore page_fit (rare, but possible when the
@@ -337,6 +360,7 @@ def run(
         best.jd_coverage_result,
         best.voice_result,
         best.fabrication_result,
+        fast=fast,
     )
     return OrchestratorResult(
         passed=False,
@@ -352,6 +376,8 @@ def _finalize_metrics(
     jd_cov: JDCoverageResult | None,
     voice: VoiceCheckResult | None,
     fab: FabricationAuditResult | None,
+    *,
+    fast: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     """Re-validate page_fit on the post-processed resume so metrics + passed are honest.
 
@@ -370,7 +396,7 @@ def _finalize_metrics(
     refreshed_pf = PageFitValidator().run(resume)
     util = refreshed_pf.payload.get("page_utilization_pct", 0)
     updated = [refreshed_pf if v.name == "page_fit" else v for v in validator_results]
-    metrics = _metrics(updated, jd_cov, voice, fab)
+    metrics = _metrics(updated, jd_cov, voice, fab, fast=fast)
     targets_met = refreshed_pf.passed and util >= 95
     return metrics, targets_met
 
@@ -892,11 +918,19 @@ def _pop_last_skill(resume: Resume) -> Resume:
     return Resume.model_validate(data)
 
 
-def _metrics(validators, jd_cov, voice, fab=None) -> dict[str, Any]:
+def _metrics(validators, jd_cov, voice, fab=None, *, fast: bool = False) -> dict[str, Any]:
     by_name = {v.name: v for v in validators}
     jd_score = jd_cov.score if jd_cov is not None else (
         by_name["jd_coverage"].score if by_name.get("jd_coverage") else None
     )
+    if fast:
+        fab_verification = "skipped"
+    elif fab is None:
+        fab_verification = "errored"
+    elif fab.flagged_bullets:
+        fab_verification = "flagged"
+    else:
+        fab_verification = "complete"
     return {
         "schema_valid": by_name.get("schema_check") and by_name["schema_check"].passed,
         "source_attribution_score": by_name.get("source_attribution") and round(by_name["source_attribution"].score, 3),
@@ -908,4 +942,5 @@ def _metrics(validators, jd_cov, voice, fab=None) -> dict[str, Any]:
         "voice_drift_max": round(voice.max_drift, 3) if voice is not None else None,
         "fabrication_pass_rate": round(fab.pass_rate, 3) if fab is not None else None,
         "fabrication_flagged_count": len(fab.flagged_bullets) if fab is not None else None,
+        "fab_verification": fab_verification,
     }

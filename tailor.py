@@ -60,6 +60,10 @@ def _print_metrics(metrics: dict, passed: bool) -> None:
     print(f"  Src att: {metrics.get('source_attribution_score', 0):.2f}  (floor 1.00)")
     print(f"  Schema : {'✓' if metrics.get('schema_valid') else '✗'}")
     print(f"  Field lock : {'✓' if metrics.get('field_lock_passed') else '✗'}")
+    fab_verify = metrics.get('fab_verification', '—')
+    flagged = metrics.get('fabrication_flagged_count')
+    fab_suffix = f" ({flagged} flagged)" if flagged else ""
+    print(f"  Fab verify : {fab_verify}{fab_suffix}")
     vd = metrics.get('voice_drift_max')
     print(f"  Voice drift (max): {vd:.2f}" if vd is not None else "  Voice drift: —")
     print(f"{'='*55}\n")
@@ -71,6 +75,13 @@ def main() -> None:
     parser.add_argument("--resume", type=Path, default=_DEFAULT_RESUME, help="Resume JSON path")
     parser.add_argument("--out", type=Path, default=None, help="Output PDF path (default: <name>_tailored.pdf)")
     parser.add_argument("--retries", type=int, default=3, help="Max retries (default: 3)")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip the fabrication audit (saves one LLM call per attempt). "
+             "Mechanical source_attribution + page_fit + JD coverage still gate. "
+             "Final metrics annotate the bypass via fab_verification: 'skipped'.",
+    )
     args = parser.parse_args()
 
     jd = _load_jd(args.jd)
@@ -106,6 +117,7 @@ def main() -> None:
         judge_model=model,
         max_retries=args.retries,
         progress=progress,
+        fast=args.fast,
     )
 
     _print_metrics(result.final_metrics, result.passed)

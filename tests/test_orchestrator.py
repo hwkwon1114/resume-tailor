@@ -535,6 +535,94 @@ def test_fix_bullets_followed_by_drop_empty_sections(monkeypatch):
     )
 
 
+def test_fast_mode_skips_fab_audit_entirely(monkeypatch):
+    """`fast=True` must not call FabricationAudit at all — saves the parallel
+    batch call per attempt and lets the orchestrator exit on mech+jd+page
+    alone. Tested by spying on FabricationAudit.run; expect call_count == 0.
+    """
+    inp = _load()
+    out = _good_tailored(inp)
+
+    fab_spy = MagicMock(return_value=MagicMock(flagged_bullets=[], pass_rate=1.0, per_bullet={}))
+
+    from harness.judges.orphan_fixer import _FixResult
+
+    class _GenModel:
+        def generate_structured(self, *, system, prompt, schema):
+            if schema is _FixResult:
+                return ModelResponse(data=_FixResult(rewrites=[], drop_ids=[]), model_name="m")
+            return ModelResponse(
+                data=TailoringResponse(reasoning="r", resume=out), model_name="m",
+            )
+        def generate_text(self, **kw):
+            return ModelResponse(data="", model_name="m")
+
+    def fake_jd_run(self, *, output_resume, jd, model):
+        return MagicMock(passed=True, score=1.0, uncovered_requirements=[])
+
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 97},
+        )
+
+    with patch("harness.orchestrator.JDCoverageJudge.run", fake_jd_run), \
+         patch("harness.judges.fabrication_audit.FabricationAudit.run", fab_spy), \
+         patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        result = run(jd="j", input_resume=inp, model=_GenModel(),
+                     max_retries=1, use_cache=False, fast=True)
+
+    assert fab_spy.call_count == 0, (
+        f"fast mode must not call FabricationAudit; got {fab_spy.call_count} calls"
+    )
+    # Even though fab didn't run, the attempt must EXIT cleanly because the
+    # honest gate accepts fab when fast=True.
+    assert result.passed is True
+    # Metrics annotate the skip so the bypass is visible to callers.
+    assert result.final_metrics.get("fab_verification") == "skipped"
+
+
+def test_default_mode_metrics_include_complete_fab_verification(monkeypatch):
+    """Without --fast, a clean fab result must annotate the metrics as
+    fab_verification: 'complete' — the inverse of the skipped path."""
+    inp = _load()
+    out = _good_tailored(inp)
+
+    audit = _good_audit(out)
+
+    class _Mod:
+        def generate_structured(self, *, system, prompt, schema):
+            from harness.judges.fabrication_audit import _AuditReport
+            from harness.judges.orphan_fixer import _FixResult
+            if schema is _AuditReport:
+                return ModelResponse(data=audit, model_name="m")
+            if schema is _FixResult:
+                return ModelResponse(data=_FixResult(rewrites=[], drop_ids=[]), model_name="m")
+            return ModelResponse(
+                data=TailoringResponse(reasoning="r", resume=out), model_name="m",
+            )
+        def generate_text(self, **kw):
+            return ModelResponse(data="", model_name="m")
+
+    def fake_jd_run(self, *, output_resume, jd, model):
+        return MagicMock(passed=True, score=1.0, uncovered_requirements=[])
+
+    def fake_pf_run(self, output):
+        return ValidationResult(
+            name="page_fit", passed=True, score=1.0, errors=[],
+            payload={"pages": 1, "overflow_bullet_ids": [],
+                     "font_substituted": False, "page_utilization_pct": 97},
+        )
+
+    with patch("harness.orchestrator.JDCoverageJudge.run", fake_jd_run), \
+         patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run):
+        result = run(jd="j", input_resume=inp, model=_Mod(), max_retries=1, use_cache=False)
+
+    assert result.passed is True
+    assert result.final_metrics.get("fab_verification") == "complete"
+
+
 def test_judge_error_does_not_count_as_pass(monkeypatch):
     """A judge that errors must NOT short-circuit to fab_passed=True / jd_passed=True.
 
