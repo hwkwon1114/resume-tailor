@@ -4,7 +4,9 @@ Replaces the mechanical token-overlap score with a semantic evaluation:
 the model reads the JD and the tailored resume and returns a 0–1 score
 plus a list of uncovered requirements.
 
-Threshold: 0.5 (half of the JD's key requirements must be addressed).
+Threshold: 0.4 (matches the judge's own prompt — "below 0.4 only if genuinely
+poor"). Tightened from 0.5 after a 3-run consistency test showed 0.45/0.65/0.68
+on identical input — LLM noise straddled the old floor.
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ from pydantic import BaseModel, Field
 from harness.models import ModelClient
 from harness.schema import Resume, iter_bullets
 
-THRESHOLD = 0.5
+THRESHOLD = 0.4
 
 _SYSTEM = """\
 You are a recruiter evaluating how well a tailored resume covers a job description.
