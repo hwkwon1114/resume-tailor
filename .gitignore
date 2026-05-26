@@ -30,6 +30,9 @@ evals/.cache/
 # Pytest
 .pytest_cache/
 
+# Playwright MCP snapshots (page YAMLs from browser-driven test sessions)
+.playwright-mcp/
+
 # Personal resume data
 resume_converted.json
 resume.json
