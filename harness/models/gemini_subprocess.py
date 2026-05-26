@@ -21,6 +21,7 @@ from harness.models._text_utils import compact_schema_dict, strip_fences
 from harness.models.base import ModelOutputError, ModelResponse
 
 GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
+GEMINI_MODEL = os.environ.get("GEMINI_CLI_MODEL", "gemini-3.1-pro-preview")
 DEFAULT_TIMEOUT = 120
 
 
@@ -44,7 +45,7 @@ def _run(prompt: str) -> str:
     resolved = _read_timeout_env()
     try:
         result = subprocess.run(
-            [GEMINI_BIN],
+            [GEMINI_BIN, "-m", GEMINI_MODEL],
             input=prompt,
             capture_output=True,
             text=True,
@@ -98,7 +99,7 @@ class GeminiSubprocessClient:
 
         return ModelResponse(
             data=data,
-            model_name="gemini-cli/subprocess",
+            model_name=f"gemini-cli/subprocess/{GEMINI_MODEL}",
             latency_ms=latency_ms,
         )
 
@@ -114,6 +115,6 @@ class GeminiSubprocessClient:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return ModelResponse(
             data=strip_fences(text),
-            model_name="gemini-cli/subprocess",
+            model_name=f"gemini-cli/subprocess/{GEMINI_MODEL}",
             latency_ms=latency_ms,
         )

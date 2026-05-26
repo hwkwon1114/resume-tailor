@@ -29,6 +29,7 @@ from harness.models.base import ModelOutputError, ModelResponse
 log = logging.getLogger(__name__)
 
 GEMINI_BIN = os.environ.get("GEMINI_CLI_BIN", "/opt/homebrew/bin/gemini")
+GEMINI_MODEL = os.environ.get("GEMINI_CLI_MODEL", "gemini-3.1-pro-preview")
 DEFAULT_PROMPT_TIMEOUT = 300  # ACP isn't subject to subprocess timeout walls
 PROTOCOL_VERSION = 1
 
@@ -52,7 +53,7 @@ class GeminiAcpClient:
         if self._initialized:
             return
         self._proc = subprocess.Popen(
-            [GEMINI_BIN, "--acp"],
+            [GEMINI_BIN, "--acp", "-m", GEMINI_MODEL],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -172,7 +173,7 @@ class GeminiAcpClient:
             data = schema.model_validate(parsed)
         except ValidationError as exc:
             raise ModelOutputError(f"ACP schema validation failed: {exc}") from exc
-        return ModelResponse(data=data, model_name="gemini-cli/acp", latency_ms=latency_ms)
+        return ModelResponse(data=data, model_name=f"gemini-cli/acp/{GEMINI_MODEL}", latency_ms=latency_ms)
 
     def generate_text(
         self,
@@ -183,7 +184,7 @@ class GeminiAcpClient:
         t0 = time.perf_counter()
         text = self._prompt(f"{system}\n\n{prompt}")
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        return ModelResponse(data=strip_fences(text), model_name="gemini-cli/acp", latency_ms=latency_ms)
+        return ModelResponse(data=strip_fences(text), model_name=f"gemini-cli/acp/{GEMINI_MODEL}", latency_ms=latency_ms)
 
     def _shutdown(self) -> None:
         if self._proc is None:

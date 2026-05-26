@@ -25,23 +25,26 @@ MAX_JD_CHARS = 20_000
 MAX_RESUME_BYTES = 200 * 1024
 
 
+@st.cache_data(show_spinner=False)
+def _render_pdf_cached(resume_json: str) -> bytes:
+    # Cached on the resume's JSON so unrelated reruns (checkbox toggles,
+    # fast-accept rerun, file-uploader churn) reuse the bytes instead of
+    # re-paying WeasyPrint's multi-second render — which is what was causing
+    # the download button to disappear under the click.
+    return render_to_pdf(Resume.model_validate_json(resume_json))
+
+
 def _load_resume(text: str) -> Resume:
     raw = json.loads(text)
     return Resume.model_validate(autopopulate_bullet_ids(raw))
 
 
-def _gemini():
-    import os
-    if os.environ.get("GEMINI_TRANSPORT", "acp") == "subprocess":
-        from harness.models.gemini_subprocess import GeminiSubprocessClient
-        return GeminiSubprocessClient()
-    from harness.models.gemini_acp import GeminiAcpClient
-    return GeminiAcpClient()
+from harness.models import get_default_judge_model, get_default_model
 
 
 def _intake_parse(text: str) -> "Resume":
     from harness.pdf_intake import text_to_resume
-    return text_to_resume(text, _gemini())
+    return text_to_resume(text, get_default_model())
 
 
 def _metric_color(value: float | None, floor: float, warn: float) -> str:
@@ -168,7 +171,8 @@ def main() -> None:
             progress_slot.info(f"{stage} (attempt {payload.get('attempt', '?')})")
 
         result = run(
-            jd=jd, input_resume=resume_obj, model=_gemini(), judge_model=_gemini(),
+            jd=jd, input_resume=resume_obj,
+            model=get_default_model(), judge_model=get_default_judge_model(),
             progress=progress, fast=fast_mode,
         )
         st.session_state["last_result"] = result
@@ -208,10 +212,17 @@ def main() -> None:
             else:
                 st.warning("Result did not fully pass the harness; see debug for details. PDF is still downloadable.")
             try:
-                pdf = render_to_pdf(result.final_resume)
-                st.download_button("Download PDF", pdf, file_name=f"{result.final_resume.contact.name.replace(' ', '_')}_resume.pdf", mime="application/pdf")
+                pdf = _render_pdf_cached(result.final_resume.model_dump_json())
             except Exception as exc:  # noqa: BLE001
+                pdf = None
                 st.error(f"Render failed: {exc}")
+            if pdf is not None:
+                raw_name = result.final_resume.contact.name or "resume"
+                fname = f"{raw_name.replace(' ', '_')}_resume.pdf"
+                st.download_button(
+                    "Download PDF", pdf, file_name=fname,
+                    mime="application/pdf", key="download_pdf",
+                )
 
             with st.expander("Debug: trajectory + raw output"):
                 st.json({
