@@ -282,14 +282,3 @@ def llm_clean_truncated(
         return None
     except Exception:
         return None
-
-
-def fix_orphans(
-    resume: Resume,
-    orphan_ids: list[str],
-    model: ModelClient,
-    *,
-    page_utilization_pct: int = 100,
-) -> Resume:
-    """Backwards-compatible wrapper: fix only orphan bullets, no overflow candidates."""
-    return fix_bullets(resume, orphan_ids, [], model, page_utilization_pct=page_utilization_pct)

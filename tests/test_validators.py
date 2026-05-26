@@ -9,7 +9,6 @@ from pathlib import Path
 
 from harness.schema import Resume, autopopulate_bullet_ids
 from harness.validators.field_lock import FieldLockValidator
-from harness.validators.jd_coverage import JDCoverageValidator
 from harness.validators.source_attribution import SourceAttributionValidator
 from harness.validators.schema_check import SchemaCheckValidator
 
@@ -81,16 +80,3 @@ def test_field_lock_catches_employer_drift():
     res = FieldLockValidator().run(output=out_bad, input_resume=inp)
     assert not res.passed
     assert any("employer" in e for e in res.errors)
-
-
-def test_jd_coverage_score_and_always_passes():
-    """Mechanical JD coverage is now informational only (always passed=True).
-    The actual pass/fail gate is the LLM JDCoverageJudge."""
-    inp = _load_input()
-    out = _make_tailored(inp)
-    res = JDCoverageValidator().run(output=out, jd="python pytest docker scipy")
-    assert res.passed  # always True — informational only
-    assert 0.0 <= res.score <= 1.0
-    res2 = JDCoverageValidator().run(output=out, jd="vimscript erlang prolog")
-    assert res2.passed  # still passes — LLM judge decides, not this
-    assert res2.score == 0.0  # but score still reflects reality

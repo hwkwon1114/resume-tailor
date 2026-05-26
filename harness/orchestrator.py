@@ -35,7 +35,6 @@ from harness.judges.orphan_fixer import (
     detect_orphans,
     detect_orphans_geometry,
     fix_bullets,
-    fix_orphans,
     llm_clean_truncated,
 )
 from harness.judges.voice_check import VoiceCheck, VoiceCheckResult
@@ -107,6 +106,18 @@ def would_pass_under_fast(record: RetryRecord) -> bool:
     return mech_pass and jd_pass and page_ok
 
 
+def _non_page_gates(record: RetryRecord, *, fast: bool = False) -> tuple[bool, bool, bool]:
+    """Returns (mech_pass, jd_pass, fab_pass) for an attempt, using the same
+    "errored ≠ pass" semantics the main decision uses (orchestrator.py:327-328).
+    Post-proc can't fix any of these — only page_fit — so the fallthrough's
+    final `passed` must AND these with the post-proc page_fit verdict.
+    """
+    mech_pass = all(v.passed for v in record.validator_results if v.name != "page_fit")
+    jd_pass = record.jd_coverage_result is not None and record.jd_coverage_result.passed
+    fab_pass = fast or (record.fabrication_result is not None and not record.fabrication_result.flagged_bullets)
+    return mech_pass, jd_pass, fab_pass
+
+
 def _attempt_score(record: RetryRecord) -> tuple[int, int, int, int, int]:
     """Lexicographic attempt quality score; lower tuple = better.
 
@@ -118,12 +129,7 @@ def _attempt_score(record: RetryRecord) -> tuple[int, int, int, int, int]:
       4. fits on one page
       5. utilization closer to 100% (capped) — prefers higher util
     """
-    mech_pass = all(v.passed for v in record.validator_results if v.name != "page_fit")
-    fab_pass = (
-        record.fabrication_result is None
-        or not record.fabrication_result.flagged_bullets
-    )
-    jd_pass = (record.jd_coverage_result is None or record.jd_coverage_result.passed)
+    mech_pass, jd_pass, fab_pass = _non_page_gates(record)
     pf = next((v for v in record.validator_results if v.name == "page_fit"), None)
     pages = pf.payload.get("pages", 1) if pf else 1
     util = pf.payload.get("page_utilization_pct", 0) if pf else 0
@@ -371,7 +377,7 @@ def run(
         best.attempt, _attempt_score(best), candidate_records[-1].attempt,
     )
     best_resume = _fix_and_trim_orphans(best.candidate, judge_client, input_resume, jd)
-    metrics, _ = _finalize_metrics(
+    metrics, pf_passed_after_postproc = _finalize_metrics(
         best_resume,
         best.validator_results,
         best.jd_coverage_result,
@@ -379,8 +385,14 @@ def run(
         best.fabrication_result,
         fast=fast,
     )
+    # Post-proc can rescue page_fit but cannot fix schema/jd/fab/voice. So the
+    # fallthrough is genuinely passing iff all non-page gates were already OK
+    # for the chosen attempt AND post-proc landed page_fit. Run 3 of the
+    # consistency test hit exactly this: page=2 at attempt time, post-proc
+    # rescued it, but `passed` was hardcoded False (UX bug).
+    mech_passed, jd_passed, fab_passed = _non_page_gates(best, fast=fast)
     return OrchestratorResult(
-        passed=False,
+        passed=mech_passed and jd_passed and fab_passed and pf_passed_after_postproc,
         final_resume=best_resume,
         trajectory=trajectory,
         final_metrics=metrics,
@@ -730,7 +742,6 @@ def _mechanical_trim_orphans(
     resume: Resume, orphan_ids: list[str], model: ModelClient | None = None
 ) -> Resume:
     """Last-resort: trim trailing words until bullet is ≤ SINGLE_LINE_MAX chars (clean single line)."""
-    from harness.judges.orphan_fixer import SINGLE_LINE_MAX
     id_set = set(orphan_ids)
     data = resume.model_dump()
     original_texts = {

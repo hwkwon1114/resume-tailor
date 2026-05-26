@@ -107,8 +107,12 @@ def test_orchestrator_runs_against_stub_no_concrete_model_imports():
 
 
 def _flagged_audit(out: Resume, flagged_bullet_id: str) -> _AuditReport:
-    """Audit report where one specific bullet is flagged (below THRESHOLD), rest are clean."""
-    from harness.judges.fabrication_audit import THRESHOLD
+    """Audit report where one specific bullet is a HARD fabrication, rest are clean.
+
+    Uses score 0.2 (the rubric anchor for "named specific not in input"), which
+    matches the "InDesign not in cited inputs" reason and stays below
+    BORDERLINE_FLOOR so the borderline-tolerance policy can't tolerate it.
+    """
     audits = []
     for key in ("experience", "education", "projects"):
         for section in out.model_dump()[key]:
@@ -116,7 +120,7 @@ def _flagged_audit(out: Resume, flagged_bullet_id: str) -> _AuditReport:
                 if b["id"] == flagged_bullet_id:
                     audits.append({
                         "bullet_id": b["id"],
-                        "support_score": THRESHOLD - 0.1,
+                        "support_score": 0.2,
                         "reason": "introduces 'InDesign', not in cited inputs",
                     })
                 else:
@@ -439,7 +443,7 @@ def test_best_of_n_selects_higher_util_attempt_when_final_is_worse():
     with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
          patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", return_value=None), \
          patch("harness.orchestrator._fix_and_trim_orphans", side_effect=fake_fix):
-        result = run(jd="python", input_resume=inp, model=model, max_retries=3)
+        result = run(jd="python", input_resume=inp, model=model, max_retries=3, use_cache=False)
 
     assert result.final_resume.summary == "ATTEMPT_0", (
         f"best-of-N must select the highest-util attempt (ATTEMPT_0 @89%); "
@@ -450,6 +454,87 @@ def test_best_of_n_selects_higher_util_attempt_when_final_is_worse():
     # The trajectory must carry the per-attempt candidate so best-of-N can replay.
     assert all(r.candidate is not None for r in result.trajectory), (
         "every successful attempt must record its candidate in trajectory"
+    )
+
+
+def test_fallthrough_honors_post_proc_page_fit_rescue():
+    """Run-3 of the 3-run consistency test surfaced this: every attempt
+    page-overflowed (so _will_exit failed each time and the fallthrough fired),
+    but the chosen attempt's other gates were clean and post-proc shrank the
+    resume back to one page. The orchestrator was hardcoding passed=False on the
+    fallthrough path, ignoring the post-proc page_fit rescue — UI showed
+    "Strict mode failed" while every metric tile was green.
+    """
+    from harness.judges.jd_coverage_judge import JDCoverageResult
+
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+
+    # First 4 page_fit calls happen during the 4 generation attempts and all
+    # overflow (pages=2). Subsequent calls (the post-proc re-validation inside
+    # _finalize_metrics) land at pages=1, util=95 — that's the rescue.
+    pf_call = {"n": 0}
+    def fake_pf_run(self, output):
+        pf_call["n"] += 1
+        return _pf_validation(pages=2 if pf_call["n"] <= 4 else 1, util=100 if pf_call["n"] <= 4 else 95)
+
+    # JD judge passes; fab audit is clean. Everything except page_fit is green.
+    def fake_jd(self, *, output_resume, jd, model):
+        return JDCoverageResult(score=0.8, passed=True, uncovered_requirements=[])
+
+    def fake_fix(resume_in, model, input_resume, jd):
+        return resume_in
+
+    model = _SequenceModel(
+        resume_queue=[good] * 4,
+        audit_queue=[_good_audit(good)] * 4,
+    )
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", fake_jd), \
+         patch("harness.orchestrator._fix_and_trim_orphans", side_effect=fake_fix):
+        result = run(jd="python", input_resume=inp, model=model, max_retries=3, use_cache=False)
+
+    assert len(result.trajectory) == 4, "all 4 attempts must run (each page-overflowed)"
+    assert result.passed is True, (
+        "fallthrough must honor post-proc page_fit rescue when all non-page "
+        "gates were clean for the chosen attempt"
+    )
+    assert result.final_metrics.get("page_fit_pages") == 1, (
+        "post-proc page_fit re-validation must land in final_metrics"
+    )
+
+
+def test_fallthrough_stays_false_when_non_page_gates_failed():
+    """Counterpart to test_fallthrough_honors_post_proc_page_fit_rescue: if the
+    chosen attempt failed something post-proc CAN'T fix (jd, fab, schema),
+    fallthrough must stay passed=False even if post-proc lands page_fit.
+    """
+    from harness.judges.jd_coverage_judge import JDCoverageResult
+
+    inp = _resume_with_skills(["Python"], bullets_per_role=2)
+    good = _good_tailored(inp)
+
+    pf_call = {"n": 0}
+    def fake_pf_run(self, output):
+        pf_call["n"] += 1
+        # All attempts overflow; post-proc rescues to pages=1, util=95.
+        return _pf_validation(pages=2 if pf_call["n"] <= 4 else 1, util=100 if pf_call["n"] <= 4 else 95)
+
+    # JD judge FAILS — post-proc can't rescue this. Passed must stay False.
+    def fake_jd(self, *, output_resume, jd, model):
+        return JDCoverageResult(score=0.2, passed=False, uncovered_requirements=["x"])
+
+    def fake_fix(resume_in, model, input_resume, jd):
+        return resume_in
+
+    model = _SequenceModel(resume_queue=[good] * 4, audit_queue=[_good_audit(good)] * 4)
+    with patch("harness.validators.page_fit.PageFitValidator.run", fake_pf_run), \
+         patch("harness.judges.jd_coverage_judge.JDCoverageJudge.run", fake_jd), \
+         patch("harness.orchestrator._fix_and_trim_orphans", side_effect=fake_fix):
+        result = run(jd="python", input_resume=inp, model=model, max_retries=3, use_cache=False)
+
+    assert result.passed is False, (
+        "JD failure can't be rescued by post-proc — passed must stay False"
     )
 
 
