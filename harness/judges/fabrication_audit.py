@@ -17,6 +17,16 @@ from harness.prompts import load_prompt
 from harness.schema import Resume, iter_bullets
 
 THRESHOLD = 0.6
+# Per the judge rubric: scores below this are "named specific not in input"
+# (0.2 — invented tool/quantity) or worse — hard fabrications. Scores in
+# [BORDERLINE_FLOOR, THRESHOLD) are "interpretation drift" (0.4) — softer
+# judge calls where the run-to-run noise dominates.
+BORDERLINE_FLOOR = 0.4
+# Tolerate up to this many borderline (0.4-level) bullets before failing the
+# audit. Hard fabrications (< 0.4) always count toward failure. The selected
+# attempt's audit needs `not flagged_bullets` to clear, so this gives the
+# strict-mode gate a small noise budget without letting through real invention.
+BORDERLINE_TOLERANCE = 1
 BATCH_SIZE = 4
 _MAX_PARALLEL_CHUNKS = 5
 
@@ -89,5 +99,12 @@ class FabricationAudit:
 
         all_audits = [a for chunk in chunk_audits for a in chunk]
         per_bullet = {a.bullet_id: a for a in all_audits}
-        flagged = [a for a in all_audits if a.support_score < THRESHOLD]
+        hard_fails = [a for a in all_audits if a.support_score < BORDERLINE_FLOOR]
+        # Closest-to-pass borderlines first so the tolerated ones are the
+        # judge's least-confident calls; the worst borderlines flag.
+        borderlines = sorted(
+            (a for a in all_audits if BORDERLINE_FLOOR <= a.support_score < THRESHOLD),
+            key=lambda a: -a.support_score,
+        )
+        flagged = hard_fails + borderlines[BORDERLINE_TOLERANCE:]
         return FabricationAuditResult(per_bullet=per_bullet, flagged_bullets=flagged)

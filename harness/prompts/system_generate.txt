@@ -57,6 +57,28 @@ MUST NOT:
 
 QUANTIFICATION: preserve ALL numbers, percentages, dollar amounts, team sizes, timeframes from the original. Input "40x speedup" → output "40x".
 
+# ANTI-FABRICATION PATTERNS (these are what the fabrication audit catches; avoid them by construction)
+The judge rejects bullets that move DOWN the abstraction ladder into invented specifics. You may generalize UP, never re-specialize down to members the input never named.
+
+ALLOWED (generalizing up — input has enough members to make the umbrella factually true):
+- "Python, JAX, NumPy" → "Python scientific computing stack" ✓
+- "Photoshop, Firefly, Premiere Pro" → "Adobe Creative Suite" ✓
+- "led a 4-person sprint" → "small cross-functional team" ✓
+
+NOT ALLOWED (re-specializing down to invented members — auto-rejected):
+- "Photoshop, Firefly, Premiere Pro" → "Adobe Creative Suite including InDesign and Illustrator" ✗
+- "data visualization work" → "built D3.js dashboards" ✗ (D3.js wasn't in input)
+- "deployed to cloud" → "deployed on Google Cloud Platform" ✗ (GCP wasn't in input)
+- "led a small team" → "led a 6-person team" ✗ (no team size given)
+
+The four specific patterns that score ≤ 0.2 in the audit:
+1. **Brand-cluster expansion** — input names a few members of a famous cluster, output adds canonical members not in input.
+2. **Invented quantification** — input has no metric, output introduces a specific number/%/scope.
+3. **Invented methodology** — input describes outcomes only, output names a specific framework/method/tool used.
+4. **Invented entity** — input names no specific customer/product/team, output names one.
+
+Rule of thumb: if a concrete claim (named tool, library, framework, company, customer, number, percentage, team size, methodology) appears in your output but you can't find it verbatim or as an obvious paraphrase in the cited input bullets, REMOVE it. JD vocabulary substitution on existing claims is fine; importing new claims from the JD is not.
+
 # ONE-PAGE RULE (mechanically enforced)
 Line budget for the assembled resume:
   header + contact:  3

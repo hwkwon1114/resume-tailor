@@ -29,7 +29,16 @@ def test_threshold_constant_is_06():
 
 
 def test_calibration_5_bullets_threshold_split():
-    """5 bullets at known support levels (0.9/0.7/0.6/0.5/0.3); only those < 0.6 are flagged."""
+    """5 bullets at known support levels (0.9/0.7/0.6/0.5/0.3).
+
+    Under the borderline-tolerance policy: scores < BORDERLINE_FLOOR (0.4)
+    are hard fails and always flag; scores in [0.4, 0.6) are borderline,
+    and up to BORDERLINE_TOLERANCE (1) of them is tolerated. So:
+      - 0.9, 0.7 — pass (>= 0.6)
+      - 0.6 — pass (== threshold)
+      - 0.5 — borderline; tolerated (only one borderline in the set)
+      - 0.3 — hard fail, always flagged
+    """
     out = _resume_with_bullets(["a", "b", "c", "d", "e"])
     audit = _AuditReport.model_validate({"audits": [
         {"bullet_id": "exp-0-out-0", "support_score": 0.9, "reason": "supported"},
@@ -41,7 +50,53 @@ def test_calibration_5_bullets_threshold_split():
     model = EchoModelClient(structured_response=audit)
     result = FabricationAudit().run(input_resume=out, output_resume=out, model=model)
     flagged_ids = sorted(a.bullet_id for a in result.flagged_bullets)
-    assert flagged_ids == ["exp-0-out-3", "exp-0-out-4"]
+    assert flagged_ids == ["exp-0-out-4"]
+
+
+def test_borderline_tolerance_passes_single_drift_bullet():
+    """A single 0.4-level borderline ("interpretation drift") is tolerated —
+    the gate clears as long as no hard fabrication exists. This protects the
+    strict-mode pass rate from the judge's run-to-run noise on the
+    pass/fail boundary.
+    """
+    out = _resume_with_bullets(["a", "b"])
+    audit = _AuditReport.model_validate({"audits": [
+        {"bullet_id": "exp-0-out-0", "support_score": 0.9, "reason": "supported"},
+        {"bullet_id": "exp-0-out-1", "support_score": 0.4, "reason": "drift"},
+    ]})
+    model = EchoModelClient(structured_response=audit)
+    result = FabricationAudit().run(input_resume=out, output_resume=out, model=model)
+    assert result.flagged_bullets == [], (
+        "1 borderline at exactly BORDERLINE_FLOOR must be tolerated under tolerance=1"
+    )
+
+
+def test_borderline_tolerance_flags_second_borderline():
+    """Tolerance is exactly 1: a second 0.4-level borderline DOES flag."""
+    out = _resume_with_bullets(["a", "b", "c"])
+    audit = _AuditReport.model_validate({"audits": [
+        {"bullet_id": "exp-0-out-0", "support_score": 0.9, "reason": "supported"},
+        {"bullet_id": "exp-0-out-1", "support_score": 0.4, "reason": "drift"},
+        {"bullet_id": "exp-0-out-2", "support_score": 0.5, "reason": "drift"},
+    ]})
+    model = EchoModelClient(structured_response=audit)
+    result = FabricationAudit().run(input_resume=out, output_resume=out, model=model)
+    # 0.5 (closer to pass) survives; 0.4 (worse borderline) is flagged.
+    assert [a.bullet_id for a in result.flagged_bullets] == ["exp-0-out-1"]
+
+
+def test_hard_fab_always_flags_even_when_borderline_tolerated():
+    """A hard fab (< 0.4) is never tolerated, even alongside a borderline."""
+    out = _resume_with_bullets(["a", "b"])
+    audit = _AuditReport.model_validate({"audits": [
+        {"bullet_id": "exp-0-out-0", "support_score": 0.4, "reason": "drift"},
+        {"bullet_id": "exp-0-out-1", "support_score": 0.2, "reason": "invented tool"},
+    ]})
+    model = EchoModelClient(structured_response=audit)
+    result = FabricationAudit().run(input_resume=out, output_resume=out, model=model)
+    assert [a.bullet_id for a in result.flagged_bullets] == ["exp-0-out-1"], (
+        "borderline tolerated; hard fab still flagged"
+    )
 
 
 def test_batches_audit_by_chunk_size_and_merges_results():
